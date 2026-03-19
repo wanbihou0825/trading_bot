@@ -244,18 +244,14 @@ class WalletMonitor:
         while self._running:
             try:
                 await self._poll_wallets()
-                # 分次睡眠，每1秒检查一次运行状态
-                for _ in range(self.poll_interval):
-                    if not self._running:
-                        break
-                    await asyncio.sleep(1)
+                await asyncio.sleep(self.poll_interval)
+            except asyncio.CancelledError:
+                logger.info("轮询循环被取消")
+                break
             except Exception as e:
                 logger.error(f"轮询异常: {e}")
                 if self._running:
-                    for _ in range(5):
-                        if not self._running:
-                            break
-                        await asyncio.sleep(1)
+                    await asyncio.sleep(5)
     
     async def _run_websocket(self) -> None:
         """WebSocket模式"""
@@ -268,25 +264,27 @@ class WalletMonitor:
         retry_count = 0
         max_retries = 5
         
-        while self._running and retry_count < max_retries:
-            try:
-                await self._connect_websocket()
-                retry_count = 0  # 重置重试计数
-            except Exception as e:
-                retry_count += 1
-                logger.error(f"WebSocket连接失败 ({retry_count}/{max_retries}): {e}")
-                if self._running:
-                    # 使用更短的睡眠间隔，并更频繁检查运行状态
-                    sleep_time = min(30, 5 * retry_count)
-                    for _ in range(int(sleep_time)):
-                        if not self._running:
-                            break
-                        await asyncio.sleep(1)
-        
-        # WebSocket失败后回退到轮询
-        if retry_count >= max_retries and self._running:
-            logger.warning("WebSocket连接失败，回退到轮询模式")
-            await self._run_polling()
+        try:
+            while self._running and retry_count < max_retries:
+                try:
+                    await self._connect_websocket()
+                    retry_count = 0  # 重置重试计数
+                except asyncio.CancelledError:
+                    logger.info("WebSocket循环被取消")
+                    break
+                except Exception as e:
+                    retry_count += 1
+                    logger.error(f"WebSocket连接失败 ({retry_count}/{max_retries}): {e}")
+                    if self._running:
+                        sleep_time = min(30, 5 * retry_count)
+                        await asyncio.sleep(sleep_time)
+            
+            # WebSocket失败后回退到轮询
+            if retry_count >= max_retries and self._running:
+                logger.warning("WebSocket连接失败，回退到轮询模式")
+                await self._run_polling()
+        except asyncio.CancelledError:
+            logger.info("WebSocket模式被取消")
     
     async def _run_hybrid(self) -> None:
         """混合模式: WebSocket为主，轮询为辅"""
@@ -305,6 +303,8 @@ class WalletMonitor:
         
         try:
             await asyncio.gather(ws_task, poll_task)
+        except asyncio.CancelledError:
+            logger.info("混合模式被取消")
         except Exception as e:
             logger.error(f"混合模式异常: {e}")
         finally:
@@ -312,21 +312,20 @@ class WalletMonitor:
     
     async def _periodic_poll(self) -> None:
         """定期轮询(作为WebSocket的补充)"""
-        while self._running:
-            # 分次睡眠，每1秒检查一次运行状态
-            sleep_time = self.poll_interval * 10
-            for _ in range(sleep_time):
+        try:
+            while self._running:
+                sleep_time = self.poll_interval * 10
+                await asyncio.sleep(sleep_time)
+                
                 if not self._running:
                     break
-                await asyncio.sleep(1)
-            
-            if not self._running:
-                break
-                
-            try:
-                await self._poll_wallets()
-            except Exception as e:
-                logger.error(f"定期轮询异常: {e}")
+                    
+                try:
+                    await self._poll_wallets()
+                except Exception as e:
+                    logger.error(f"定期轮询异常: {e}")
+        except asyncio.CancelledError:
+            logger.info("定期轮询被取消")
     
     async def _connect_websocket(self) -> None:
         """连接WebSocket"""

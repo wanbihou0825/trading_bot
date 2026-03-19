@@ -368,23 +368,28 @@ class WebSocketManager:
         await self._emit_event("disconnect")
         
         # 尝试重连
-        for attempt in range(1, self.max_reconnect_attempts + 1):
-            logger.info(f"尝试重连 ({attempt}/{self.max_reconnect_attempts})...")
+        try:
+            for attempt in range(1, self.max_reconnect_attempts + 1):
+                logger.info(f"尝试重连 ({attempt}/{self.max_reconnect_attempts})...")
+                
+                self._reconnect_count += 1
+                
+                if await self.connect():
+                    logger.info("重连成功")
+                    await self._emit_event("reconnect", {"attempt": attempt})
+                    return
+                
+                # 指数退避
+                wait_time = min(self.reconnect_interval * (2 ** min(attempt - 1, 5)), 60)
+                await asyncio.sleep(wait_time)
             
-            self._reconnect_count += 1
+            logger.error(f"重连失败，已达最大尝试次数 {self.max_reconnect_attempts}")
+            self._state = ConnectionState.DISCONNECTED
+            await self._emit_event("error", {"error": "重连失败"})
             
-            if await self.connect():
-                logger.info("重连成功")
-                await self._emit_event("reconnect", {"attempt": attempt})
-                return
-            
-            # 指数退避
-            wait_time = min(self.reconnect_interval * (2 ** min(attempt - 1, 5)), 60)
-            await asyncio.sleep(wait_time)
-        
-        logger.error(f"重连失败，已达最大尝试次数 {self.max_reconnect_attempts}")
-        self._state = ConnectionState.DISCONNECTED
-        await self._emit_event("error", {"error": "重连失败"})
+        except asyncio.CancelledError:
+            logger.info("重连循环被取消")
+            self._state = ConnectionState.DISCONNECTED
     
     async def _emit_event(self, event: str, data: Dict[str, Any] = None) -> None:
         """触发事件"""

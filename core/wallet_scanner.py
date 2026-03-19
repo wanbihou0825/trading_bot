@@ -95,21 +95,25 @@ class WalletScanner:
     
     async def _scan_loop(self):
         """扫描循环"""
-        while self._running:
-            try:
-                await self._discover_wallets()
-                
-                # 维护跟单列表
-                await self._maintain_following_list()
-                
-            except Exception as e:
-                logger.error(f"扫描异常: {e}")
-            
-            # 分次睡眠，每秒检查一次运行状态
-            for _ in range(self.scan_interval):
-                if not self._running:
+        try:
+            while self._running:
+                try:
+                    await self._discover_wallets()
+                    
+                    # 维护跟单列表
+                    await self._maintain_following_list()
+                    
+                    await asyncio.sleep(self.scan_interval)
+                    
+                except asyncio.CancelledError:
+                    logger.info("扫描循环被取消")
                     break
-                await asyncio.sleep(1)
+                except Exception as e:
+                    logger.error(f"扫描异常: {e}")
+                    if self._running:
+                        await asyncio.sleep(60)  # 异常后等待1分钟
+        except asyncio.CancelledError:
+            logger.info("扫描器退出")
     
     async def _discover_wallets(self):
         """发现新的高质量钱包"""

@@ -11,6 +11,12 @@ Polymarket 自适应跟单机器人
 - WebSocket实时监控
 - 风险管理和熔断保护
 - Telegram 通知
+- ─── 生产级安全功能 ───
+- 紧急停止文件检测
+- 强制平仓兜底
+- 结构化日志+交易流水
+- 监控告警（心跳、余额异常）
+- Slippage/价格偏差保护
 
 使用:
     python main.py              # 实盘模式
@@ -23,7 +29,7 @@ import signal
 import sys
 from datetime import datetime, timezone
 from decimal import Decimal
-from typing import Optional
+from typing import Any, Optional
 
 from config import get_settings, Settings
 from core.exceptions import GracefulShutdown, InitializationError
@@ -42,6 +48,12 @@ from services.polymarket_client import PolymarketClient
 from services.telegram_service import TelegramService
 from utils.logger import setup_logging, get_logger, mask_wallet_address
 
+# ─── 生产级安全功能导入 ───
+from utils.emergency_stop import EmergencyStop, ForcedLiquidation
+from utils.structured_logging import TradeLogger, AuditLogger, setup_structured_logging
+from utils.monitoring import MonitoringService, HealthStatus, ErrorNotifier
+from utils.slippage_protection import SlippageProtection, OrderValidator
+
 logger = get_logger(__name__)
 
 
@@ -50,6 +62,7 @@ class TradingBot:
     交易机器人主类
     
     协调各个组件完成交易流程，支持策略交易和跟单交易。
+    集成生产级安全功能：紧急停止、强制平仓、监控告警等。
     """
     
     def __init__(self, settings: Settings):
@@ -64,8 +77,20 @@ class TradingBot:
         self._shutdown_requested = False
         self._main_tasks = []
         
+        # 初始化日志系统（结构化日志）
+        self.trade_logger, self.audit_logger = setup_structured_logging(
+            log_dir="logs",
+            log_level="INFO",
+            enable_json_logs=True,
+            enable_trade_logs=True,
+            enable_audit_logs=True
+        )
+        
         # 初始化组件
         self._init_components()
+        
+        # 初始化生产级安全功能
+        self._init_safety_features()
         
         logger.info(
             f"交易机器人初始化 | "
@@ -196,6 +221,64 @@ class TradingBot:
         # 设置钱包发现回调
         self.wallet_scanner.set_discovery_callback(self._on_wallet_discovered)
     
+    def _init_safety_features(self) -> None:
+        """初始化生产级安全功能"""
+        
+        # 1. 紧急停止机制
+        self.emergency_stop = EmergencyStop(
+            stop_file_path="EMERGENCY_STOP",
+            check_interval=5.0,
+            on_stop_callback=self._on_emergency_stop
+        )
+        
+        # 2. 强制平仓管理器
+        self.forced_liquidation = ForcedLiquidation(
+            client=self.client,
+            risk_manager=self.risk_manager,
+            telegram=self.telegram
+        )
+        
+        # 3. Slippage保护
+        self.slippage_protection = SlippageProtection(
+            client=self.client,
+            max_slippage=self.settings.risk.max_slippage,
+            max_price_deviation=Decimal("0.05")
+        )
+        
+        # 4. 订单验证器
+        self.order_validator = OrderValidator(
+            client=self.client,
+            risk_manager=self.risk_manager,
+            slippage_protection=self.slippage_protection
+        )
+        
+        # 5. 监控服务
+        self.monitoring = MonitoringService(
+            telegram=self.telegram,
+            heartbeat_interval=300.0,
+            balance_check_interval=300.0
+        )
+        
+        # 6. 错误通知器
+        self.error_notifier = ErrorNotifier(telegram=self.telegram)
+        
+        logger.info("生产级安全功能初始化完成")
+    
+    async def _on_emergency_stop(self) -> None:
+        """紧急停止回调"""
+        logger.critical("🚨 紧急停止触发，执行强制平仓...")
+        
+        # 记录审计日志
+        if self.audit_logger:
+            self.audit_logger.log_emergency_stop("检测到紧急停止文件")
+        
+        # 强制平仓
+        await self.forced_liquidation.liquidate_all(reason="紧急停止")
+        
+        # 停止机器人
+        self._shutdown_requested = True
+        self._running = False
+    
     async def start(self) -> None:
         """启动机器人"""
         logger.info("正在启动交易机器人...")
@@ -216,6 +299,9 @@ class TradingBot:
         if balance:
             self.risk_manager.update_balance(balance)
             logger.info(f"账户余额: ${balance:.2f}")
+            
+            # 设置预期余额（用于监控）
+            self.monitoring.set_expected_balance(balance)
         
         # 添加目标钱包 (如果有手动配置)
         for wallet in self.settings.copy_trading.target_wallets:
@@ -229,6 +315,17 @@ class TradingBot:
         # 注册跟单回调
         self.wallet_monitor.on_trade(self._on_wallet_trade)
         
+        # ─── 启动生产级安全功能 ───
+        
+        # 启动紧急停止监控
+        await self.emergency_stop.start()
+        
+        # 启动监控服务
+        self.monitoring.set_balance_provider(self._get_balance)
+        self.monitoring.register_component("client", self._check_client_health)
+        self.monitoring.register_component("risk_manager", self._check_risk_manager_health)
+        await self.monitoring.start()
+        
         # 发送启动通知
         await self.telegram.send_startup_notification(
             wallet_address=self.settings.wallet_address,
@@ -239,12 +336,44 @@ class TradingBot:
         self._running = True
         logger.info("交易机器人已启动")
         
+        # 记录审计日志
+        if self.audit_logger:
+            self.audit_logger.log_event(
+                event_type="BOT_START",
+                description="交易机器人启动",
+                dry_run=self.settings.dry_run
+            )
+        
         try:
             await self._run_main_loop()
         except GracefulShutdown:
             logger.info("收到关闭信号，正在停止...")
         finally:
             await self.stop()
+    
+    async def _get_balance(self) -> Decimal:
+        """获取余额（用于监控）"""
+        return await self.client.get_account_balance() or Decimal("0")
+    
+    async def _check_client_health(self) -> HealthStatus:
+        """检查客户端健康状态"""
+        is_connected = self.client.is_connected
+        return HealthStatus(
+            component="client",
+            is_healthy=is_connected,
+            last_check=datetime.now(timezone.utc),
+            message="已连接" if is_connected else "未连接"
+        )
+    
+    async def _check_risk_manager_health(self) -> HealthStatus:
+        """检查风险管理器健康状态"""
+        can_trade, reason = self.circuit_breaker.check_can_trade()
+        return HealthStatus(
+            component="risk_manager",
+            is_healthy=can_trade,
+            last_check=datetime.now(timezone.utc),
+            message=reason if not can_trade else "正常"
+        )
     
     async def stop(self) -> None:
         """停止机器人"""
@@ -253,6 +382,14 @@ class TradingBot:
         
         self._running = False
         logger.info("正在停止交易机器人...")
+        
+        # ─── 停止生产级安全功能 ───
+        
+        # 停止紧急停止监控
+        await self.emergency_stop.stop()
+        
+        # 停止监控服务
+        await self.monitoring.stop()
         
         # 取消所有任务
         if self._main_tasks:
@@ -277,14 +414,21 @@ class TradingBot:
         if self.ws_manager:
             await self.ws_manager.disconnect()
         
-        # 平掉所有持仓
-        await self._close_all_positions("机器人关闭")
+        # ─── 强制平仓所有持仓（兜底机制）───
+        await self.forced_liquidation.liquidate_all(reason="机器人关闭")
         
         # 断开连接
         await self.client.disconnect()
         
         # 发送停止通知
         await self.telegram.send_shutdown_notification("用户请求停止")
+        
+        # 记录审计日志
+        if self.audit_logger:
+            self.audit_logger.log_event(
+                event_type="BOT_STOP",
+                description="交易机器人停止"
+            )
         
         logger.info("交易机器人已停止")
     
@@ -330,19 +474,16 @@ class TradingBot:
                 # 扫描市场机会
                 await self._scan_markets()
                 
-                # 等待下一次扫描，分次睡眠以便快速响应停止
-                for _ in range(scan_interval):
-                    if not self._running or self._shutdown_requested:
-                        break
-                    await asyncio.sleep(1)
+                # asyncio.sleep 本身支持被 cancel，会立即抛 CancelledError
+                await asyncio.sleep(scan_interval)
                 
+            except asyncio.CancelledError:
+                logger.info("策略交易循环收到取消信号，正在退出...")
+                break
             except Exception as e:
                 logger.error(f"策略交易循环异常: {e}")
                 if self._running and not self._shutdown_requested:
-                    for _ in range(10):
-                        if not self._running or self._shutdown_requested:
-                            break
-                        await asyncio.sleep(1)
+                    await asyncio.sleep(10)
     
     async def _websocket_loop(self) -> None:
         """WebSocket循环"""
@@ -355,7 +496,12 @@ class TradingBot:
         self.ws_manager.on_event("error", self._on_ws_error)
         
         # 连接WebSocket
-        await self.ws_manager.connect()
+        try:
+            await self.ws_manager.connect()
+        except asyncio.CancelledError:
+            logger.info("WebSocket循环收到取消信号，正在退出...")
+            await self.ws_manager.disconnect()
+            raise
     
     async def _position_check_loop(self) -> None:
         """持仓检查循环"""
@@ -364,18 +510,14 @@ class TradingBot:
         while self._running and not self._shutdown_requested:
             try:
                 await self._check_position_exits()
-                # 分次睡眠，每秒检查停止标志
-                for _ in range(check_interval):
-                    if not self._running or self._shutdown_requested:
-                        break
-                    await asyncio.sleep(1)
+                await asyncio.sleep(check_interval)
+            except asyncio.CancelledError:
+                logger.info("持仓检查循环收到取消信号，正在退出...")
+                break
             except Exception as e:
                 logger.error(f"持仓检查异常: {e}")
                 if self._running and not self._shutdown_requested:
-                    for _ in range(10):
-                        if not self._running or self._shutdown_requested:
-                            break
-                        await asyncio.sleep(1)
+                    await asyncio.sleep(10)
     
     async def _periodic_report_loop(self) -> None:
         """定期报告循环"""
@@ -383,11 +525,7 @@ class TradingBot:
         
         while self._running and not self._shutdown_requested:
             try:
-                # 分次睡眠，每秒检查停止标志
-                for _ in range(report_interval):
-                    if not self._running or self._shutdown_requested:
-                        break
-                    await asyncio.sleep(1)
+                await asyncio.sleep(report_interval)
                 
                 if not self._running or self._shutdown_requested:
                     break
@@ -404,6 +542,9 @@ class TradingBot:
                     f"当前持仓: {len(self.risk_manager.get_positions())}"
                 )
                 
+            except asyncio.CancelledError:
+                logger.info("定期报告循环收到取消信号，正在退出...")
+                break
             except Exception as e:
                 logger.error(f"定期报告异常: {e}")
     
@@ -414,7 +555,7 @@ class TradingBot:
         except Exception as e:
             logger.error(f"处理钱包交易异常: {e}")
     
-    async def _on_wallet_discovered(self, wallet_address: str, wallet_info: dict) -> None:
+    async def _on_wallet_discovered(self, wallet_address: str, wallet_info: dict[str, Any]) -> None:
         """发现高质量钱包回调 - 自动添加到监控列表"""
         try:
             # 添加到钱包监控
@@ -423,19 +564,27 @@ class TradingBot:
             quality = wallet_info.get("quality")
             
             # 发送通知
-            await self.telegram.send_message(
-                f"🎯 发现高质量钱包\n"
-                f"地址: {wallet_address[:10]}...\n"
-                f"评分: {quality.overall_score:.1f}\n"
-                f"胜率: {quality.stats.win_rate*100:.1f}%\n"
-                f"盈亏比: {quality.stats.profit_factor:.2f}\n"
-                f"已自动添加到监控列表"
-            )
-            
-            logger.info(
-                f"自动添加高质量钱包到监控: {wallet_address[:10]}... "
-                f"(评分: {quality.overall_score:.1f}, 胜率: {quality.stats.win_rate*100:.1f}%)"
-            )
+            if quality:
+                await self.telegram.send_message(
+                    f"🎯 发现高质量钱包\n"
+                    f"地址: {wallet_address[:10]}...\n"
+                    f"评分: {getattr(quality, 'overall_score', 'N/A')}\n"
+                    f"胜率: {getattr(getattr(quality, 'stats', None), 'win_rate', 0)*100:.1f}%\n"
+                    f"盈亏比: {getattr(getattr(quality, 'stats', None), 'profit_factor', 0):.2f}\n"
+                    f"已自动添加到监控列表"
+                )
+                
+                logger.info(
+                    f"自动添加高质量钱包到监控: {wallet_address[:10]}... "
+                    f"(评分: {getattr(quality, 'overall_score', 'N/A')}, "
+                    f"胜率: {getattr(getattr(quality, 'stats', None), 'win_rate', 0)*100:.1f}%)"
+                )
+            else:
+                await self.telegram.send_message(
+                    f"🎯 发现钱包\n"
+                    f"地址: {wallet_address[:10]}...\n"
+                    f"已添加到监控列表"
+                )
             
         except Exception as e:
             logger.error(f"处理钱包发现回调异常: {e}")
@@ -475,7 +624,7 @@ class TradingBot:
             
             await self._analyze_and_trade(market_info)
     
-    async def _analyze_and_trade(self, market_info: dict) -> None:
+    async def _analyze_and_trade(self, market_info: dict[str, Any]) -> None:
         """分析市场并执行交易"""
         # 解析市场数据
         market_data = self.client.parse_market_data(market_info)
@@ -518,13 +667,28 @@ class TradingBot:
         # 使用建议仓位
         final_size = risk_result.suggested_size or size
         
+        # ─── Slippage保护：下单前价格检查 ───
+        price_check = await self.slippage_protection.check_price_before_order(
+            market_id=market_data.market_id,
+            side=side,
+            expected_price=price,
+            size=final_size
+        )
+        
+        if price_check.action == "cancel":
+            logger.warning(f"订单取消（价格偏差过大）: {price_check.reason}")
+            return
+        
+        # 使用调整后的价格（如果有）
+        final_price = price_check.adjusted_price or price
+        
         # 发送交易通知
         await self.telegram.send_trade_notification(
             action="开仓",
             market_question=market_data.question,
             side=side,
             amount=final_size,
-            price=price,
+            price=final_price,
             confidence=result.confidence,
             strategy=result.strategy_type.value
         )
@@ -534,12 +698,12 @@ class TradingBot:
             market_id=market_data.market_id,
             side=side,
             size=final_size,
-            price=price
+            price=final_price
         )
         
         if order_result.success:
             # 开仓记录
-            self.risk_manager.open_position(
+            position = self.risk_manager.open_position(
                 market_id=market_data.market_id,
                 market_question=market_data.question,
                 side=side,
@@ -547,13 +711,41 @@ class TradingBot:
                 size=order_result.filled_size
             )
             
+            # ─── 记录交易日志 ───
+            if self.trade_logger:
+                self.trade_logger.log_position_open(
+                    market_id=market_data.market_id,
+                    market_question=market_data.question,
+                    side=side,
+                    size=order_result.filled_size,
+                    entry_price=order_result.filled_price,
+                    stop_loss=position.stop_loss_price if position else None,
+                    take_profit=position.take_profit_price if position else None,
+                    strategy=result.strategy_type.value,
+                    confidence=float(result.confidence)
+                )
+            
             logger.info(
                 f"开仓成功 | 市场: {market_data.question[:30]}... | "
                 f"方向: {side} | 价格: {order_result.filled_price} | "
                 f"仓位: ${order_result.filled_size}"
             )
+            
+            # 更新预期余额
+            cost = order_result.filled_size * order_result.filled_price
+            self.monitoring.balance.update_expected_balance(-cost)
+            
         else:
             logger.error(f"下单失败: {order_result.error}")
+            
+            # 记录失败日志
+            if self.audit_logger:
+                self.audit_logger.log_event(
+                    event_type="ORDER_FAILED",
+                    description=f"下单失败: {order_result.error}",
+                    severity="WARNING",
+                    market_id=market_data.market_id
+                )
     
     async def _check_position_exits(self) -> None:
         """检查持仓退出条件"""
@@ -574,7 +766,7 @@ class TradingBot:
         for exit_info in exits:
             await self._close_position(exit_info)
     
-    async def _close_position(self, exit_info: dict) -> None:
+    async def _close_position(self, exit_info: dict[str, Any]) -> None:
         """平仓"""
         market_id = exit_info["market_id"]
         exit_price = exit_info["exit_price"]
@@ -582,12 +774,30 @@ class TradingBot:
         
         position = self.risk_manager.close_position(market_id, exit_price)
         if position:
+            # ─── 记录交易日志 ───
+            if self.trade_logger:
+                self.trade_logger.log_position_close(
+                    market_id=market_id,
+                    market_question=position.market_question,
+                    side=position.side,
+                    size=position.size,
+                    exit_price=exit_price,
+                    entry_price=position.entry_price,
+                    pnl=float(position.pnl),
+                    pnl_pct=float(position.pnl_percentage),
+                    reason=reason
+                )
+            
             await self.telegram.send_position_closed_notification(
                 market_question=position.market_question,
                 pnl=position.pnl,
                 pnl_percentage=position.pnl_percentage,
                 reason=reason
             )
+            
+            # 更新预期余额
+            revenue = position.size * exit_price
+            self.monitoring.balance.update_expected_balance(revenue)
     
     async def _close_all_positions(self, reason: str) -> None:
         """平掉所有持仓"""
@@ -644,23 +854,38 @@ async def main() -> None:
     # 创建机器人
     bot = TradingBot(settings)
     
-    # 设置信号处理
-    def signal_handler(sig, frame):
-        logger.info(f'收到信号: {sig}，正在停止...')
-        bot.request_shutdown('收到中断信号')
+    # ─── asyncio 事件循环信号处理（官方推荐方式）───
+    loop = asyncio.get_running_loop()
     
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
+    def shutdown_handler(sig):
+        """信号处理器：优雅关闭所有任务"""
+        logger.info(f"收到信号 {sig}，启动优雅关闭...")
+        bot.request_shutdown(f"收到信号 {sig}")
+        
+        # 立即取消所有仍在运行的任务（关键！）
+        for task in asyncio.all_tasks(loop):
+            if task is not asyncio.current_task(loop):
+                task.cancel()
+    
+    # 注册到事件循环
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        loop.add_signal_handler(sig, shutdown_handler, sig)
     
     # 运行
     try:
         await bot.start()
+    except asyncio.CancelledError:
+        logger.info("主协程被取消（优雅关闭完成）")
     except InitializationError as e:
         logger.error(f"初始化失败: {e}")
         sys.exit(1)
     except Exception as e:
         logger.error(f"运行异常: {e}")
         sys.exit(1)
+    finally:
+        # 确保 stop 被调用
+        if bot._running:
+            await bot.stop()
 
 
 if __name__ == "__main__":
