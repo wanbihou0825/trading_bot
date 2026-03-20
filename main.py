@@ -53,6 +53,7 @@ from utils.emergency_stop import EmergencyStop, ForcedLiquidation
 from utils.structured_logging import TradeLogger, AuditLogger, setup_structured_logging
 from utils.monitoring import MonitoringService, HealthStatus, ErrorNotifier
 from utils.slippage_protection import SlippageProtection, OrderValidator
+from utils.trade_persistence import TradePersistence  # 交易持久化
 
 logger = get_logger(__name__)
 
@@ -126,7 +127,8 @@ class TradingBot:
         
         # 4. Polymarket 客户端
         self.client = PolymarketClient(
-            api_url=self.settings.polymarket_api_url,
+            private_key=self.settings.private_key,
+            wallet_address=self.settings.wallet_address,
             dry_run=self.settings.dry_run
         )
         
@@ -182,7 +184,12 @@ class TradingBot:
         else:
             self.ws_manager = None
         
-        # 11. 跟单执行器
+        # 11. 交易持久化 (幂等性保证)
+        self.persistence = TradePersistence(
+            db_path=self.settings.copy_trading.trade_db_path
+        )
+        
+        # 12. 跟单执行器
         copy_config = CopyConfig(
             mode=CopyMode(self.settings.copy_trading.mode),
             fixed_amount=self.settings.copy_trading.fixed_amount,
@@ -201,9 +208,10 @@ class TradingBot:
             warning_detector=self.warning_detector,
             telegram=self.telegram,
             copy_config=copy_config,
+            persistence=self.persistence,  # 传入持久化管理器
         )
         
-        # 12. 钱包扫描器 - 自动发现高质量钱包
+        # 13. 钱包扫描器 - 自动发现高质量钱包
         self.wallet_scanner = WalletScanner(
             quality_scorer=self.quality_scorer,
             mm_detector=self.market_maker_detector,

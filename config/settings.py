@@ -98,6 +98,8 @@ class CopyTradingConfig:
     enabled: bool = True
     # 自动发现高质量钱包 (无需手动配置目标钱包)
     auto_discover: bool = True
+    # 交易数据库路径 (用于幂等性和历史记录)
+    trade_db_path: str = "data/trades.db"
     # 最大跟单钱包数
     max_following_wallets: int = 10
     # 跟单模式: full, proportional, fixed, smart

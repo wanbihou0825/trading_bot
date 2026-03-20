@@ -25,6 +25,7 @@ from core.red_flag_detector import RedFlagDetector, RedFlag
 from services.polymarket_client import PolymarketClient, OrderResult
 from services.telegram_service import TelegramService
 from core.wallet_monitor import WalletTransaction
+from utils.trade_persistence import TradePersistence  # 交易持久化
 
 logger = get_logger(__name__)
 
@@ -130,6 +131,7 @@ class CopyExecutor:
         warning_detector: RedFlagDetector,
         telegram: Optional[TelegramService] = None,
         copy_config: Optional[CopyConfig] = None,
+        persistence: Optional[TradePersistence] = None,  # 交易持久化
     ):
         self.client = client
         self.risk_manager = risk_manager
@@ -138,6 +140,7 @@ class CopyExecutor:
         self.warning_detector = warning_detector
         self.telegram = telegram
         self.config = copy_config or CopyConfig()
+        self.persistence = persistence  # 持久化管理器
         
         # 钱包评分缓存
         self._wallet_scores: Dict[str, QualityScore] = {}
@@ -158,7 +161,8 @@ class CopyExecutor:
         logger.info(
             f"跟单执行器初始化 | 模式: {self.config.mode.value} | "
             f"延迟: {self.config.copy_delay_seconds}s | "
-            f"跟平仓: {'是' if self.config.follow_close else '否'}"
+            f"跟平仓: {'是' if self.config.follow_close else '否'} | "
+            f"持久化: {'启用' if self.persistence else '禁用'}"
         )
     
     async def start(self) -> None:
@@ -195,6 +199,16 @@ class CopyExecutor:
         """
         if not self.config.enabled:
             return None
+        
+        # 幂等性检查 (防止重复跟单)
+        if self.persistence:
+            is_processed = await self.persistence.is_processed(tx.tx_hash)
+            if is_processed:
+                logger.info(
+                    f"跳过已处理交易 | Hash: {tx.tx_hash[:10]}... | "
+                    f"钱包: {tx.wallet_address[:10]}..."
+                )
+                return None
         
         logger.info(
             f"处理交易信号 | 钱包: {tx.wallet_address[:10]}... | "
@@ -312,6 +326,18 @@ class CopyExecutor:
                     f"方向: {copy_trade.side} | 金额: ${copy_trade.copy_size}"
                 )
                 
+                # 标记为已处理（幂等性）
+                if self.persistence:
+                    await self.persistence.mark_processed(
+                        tx_hash=tx.tx_hash,
+                        wallet_address=tx.wallet_address,
+                        market_id=tx.market_id,
+                        action="open",
+                        status="success",
+                        copy_size=order_result.filled_size,
+                        copy_price=order_result.filled_price
+                    )
+                
                 # 发送通知
                 if self.telegram:
                     await self.telegram.send_trade_notification(
@@ -408,6 +434,18 @@ class CopyExecutor:
                     f"跟单平仓成功 | 市场: {copy_trade.market_question[:30]}... | "
                     f"盈亏: ${closed_position.pnl if closed_position else 'N/A'}"
                 )
+                
+                # 标记为已处理（幂等性）
+                if self.persistence:
+                    await self.persistence.mark_processed(
+                        tx_hash=tx.tx_hash,
+                        wallet_address=tx.wallet_address,
+                        market_id=tx.market_id,
+                        action="close",
+                        status="success",
+                        copy_size=our_position.size,
+                        copy_price=order_result.filled_price
+                    )
                 
                 # 发送通知
                 if self.telegram and closed_position:
