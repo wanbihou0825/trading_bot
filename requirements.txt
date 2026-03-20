@@ -3,6 +3,9 @@
 # Web3 和区块链
 web3>=6.0.0
 
+# Ethereum 账户管理 (L2 API 签名必需!)
+eth_account>=0.10.0
+
 # 异步HTTP客户端
 aiohttp>=3.9.0
 

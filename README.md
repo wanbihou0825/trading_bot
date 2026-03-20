@@ -9,9 +9,16 @@
 - **自适应策略选择** - 根据市场状态自动选择最优策略
 - **Endgame Sweeper** - 高概率收割策略 (95%+ 概率)
 - **钱包跟单** - 实时跟踪目标钱包交易
+  - ✅ **开仓跟单** - 自动复制目标钱包的买入交易
+  - ✅ **平仓跟单** - 自动跟随目标钱包的平仓操作（避免持仓失控！）
+  - ✅ **持仓同步** - 定期检查目标持仓，自动平仓未跟踪的仓位
+- **L2 API 认证** - 完整的 Polymarket CLOB API 认证支持
+  - 自动派生 API credentials（apiKey/secret/passphrase）
+  - 支持 EOA、Poly Proxy、Gnosis Safe 签名类型
 - **WebSocket 支持** - 实时市场数据推送
 - **风险管理** - 止损止盈、仓位控制、熔断保护
 - **Telegram 通知** - 交易提醒和状态报告
+- **交易持久化** - SQLite 存储，重启后不重复跟单
 
 ### 钱包质量评估
 
@@ -47,10 +54,24 @@ nano .env
 
 ### 必需配置
 
-- `PRIVATE_KEY` - 钱包私钥
+- `PRIVATE_KEY` - 钱包私钥（用于 L2 API 认证）
 - `WALLET_ADDRESS` - 钱包地址
 - `POLYGON_RPC_URL` - Polygon RPC端点
 - `POLYGONSCAN_API_KEY` - Polygonscan API密钥 (跟单功能)
+
+### Polymarket API 说明
+
+本项目集成了完整的 Polymarket API：
+
+1. **Gamma API** (`https://gamma-api.polymarket.com`) - 市场元数据（公开）
+2. **Data API** (`https://data-api.polymarket.com`) - 用户活动/持仓（公开/轻认证）
+3. **CLOB API** (`https://clob.polymarket.com`) - 交易执行（需 L2 认证）
+
+**L2 API 认证流程**：
+- 客户端会自动使用私钥签名
+- 调用 `/auth/api-key` 端点派生 credentials
+- 后续请求自动添加认证头
+- 无需手动配置 apiKey/secret/passphrase
 
 ### 运行
 
@@ -104,16 +125,56 @@ COPY_TRADING_MODE=smart
 
 # 最大跟单金额
 COPY_MAX_AMOUNT=50
+
+# 跟单模式配置
+COPY_FOLLOW_CLOSE=true              # 是否跟平仓
+COPY_CLOSE_ON_TARGET_CLOSE=true     # 目标平仓时自动平仓
+COPY_POSITION_SYNC_INTERVAL=300    # 持仓同步间隔(秒)
 ```
+
+### 平仓跟单说明
+
+**关键功能**：避免持仓失控！
+
+| 场景 | 目标钱包行为 | 你的 Bot 行为 |
+|------|-------------|--------------|
+| 正常开仓 | 买入 YES | ✅ 跟单买入 YES |
+| 目标平仓 | 卖出 YES | ✅ 自动卖出 YES（跟平仓） |
+| 遗漏检测 | 目标已平但我们还持有 | ✅ 定期同步自动平仓 |
+
+**配置选项**：
+- `COPY_FOLLOW_CLOSE=true` - 启用平仓跟单
+- `COPY_CLOSE_ON_TARGET_CLOSE=true` - 目标平仓时自动平仓
+- `COPY_POSITION_SYNC_INTERVAL=300` - 每5分钟检查一次持仓同步
 
 ### 钱包质量等级
 
-| 等级 | 分数范围 | 最大配置比例 |
-|------|----------|-------------|
-| Elite | 9.0-10.0 | 15% |
-| Expert | 7.0-8.9 | 10% |
-| Good | 5.0-6.9 | 7% |
-| Poor | <5.0 | 排除 |
+| 等级 | 分数范围 | 最大配置比例 | 跟单倍数 |
+|------|----------|-------------|----------|
+| Elite | 9.0-10.0 | 15% | 2.0x |
+| Expert | 7.0-8.9 | 10% | 1.5x |
+| Good | 5.0-6.9 | 7% | 1.0x |
+| Poor | <5.0 | 排除 | - |
+
+### 滑点保护
+
+**动态滑点调整**（根据流动性自动调整）：
+
+| 流动性 | 滑点 | 说明 |
+|--------|------|------|
+| > $100k | 1% | 高流动性，默认值 |
+| $50k-$100k | 1.25% | 中高流动性，+25% |
+| $10k-$50k | 1.5% | 中流动性，+50% |
+| < $10k | 2% | 低流动性，+100% + 警告 |
+
+**配置项**：
+```env
+# 滑点配置
+MAX_SLIPPAGE=0.01                 # 默认最大滑点 1%
+MAX_PRICE_DEVIATION=0.03          # 默认价格偏差 3%
+SLIPPAGE_MIN_LIQUIDITY=10000     # 最小流动性 $10k
+SLIPPAGE_DYNAMIC=true             # 启用动态调整
+```
 
 ## 目录结构
 
@@ -131,13 +192,13 @@ polymarket-copy-bot-new/
 │   ├── wallet_monitor.py         # 钱包监控
 │   ├── wallet_scanner.py         # 钱包扫描器
 │   ├── websocket_manager.py      # WebSocket
-│   └── copy_executor.py          # 跟单执行
+│   └── copy_executor.py          # 跟单执行 (含平仓逻辑)
 ├── strategies/           # 交易策略
 │   ├── base.py           # 策略基类
 │   ├── endgame.py        # Endgame策略
 │   └── adaptive.py       # 自适应管理器
 ├── services/             # 外部服务
-│   ├── polymarket_client.py  # API客户端
+│   ├── polymarket_client.py  # API客户端 (L2认证+Data API)
 │   └── telegram_service.py   # 通知服务
 ├── utils/                # 工具函数
 │   ├── logger.py         # 日志系统
@@ -149,13 +210,16 @@ polymarket-copy-bot-new/
 │   ├── monitoring.py     # 监控告警
 │   ├── multi_provider.py # 多RPC/WS failover
 │   ├── gas_nonce.py      # Nonce管理+Gas优化
-│   └── slippage_protection.py  # Slippage保护
+│   ├── slippage_protection.py  # Slippage保护 (动态调整)
+│   └── trade_persistence.py     # 交易持久化 (SQLite)
 ├── tests/                # 测试套件
 │   ├── conftest.py       # pytest配置+fixtures
 │   ├── test_risk_manager.py    # 风险管理测试
 │   ├── test_polymarket_client.py  # 客户端测试
 │   ├── test_copy_executor.py  # 跟单执行测试
 │   └── test_integration.py    # 集成测试
+├── data/                 # 数据目录 (运行时生成)
+│   └── trades.db        # SQLite 交易数据库
 ├── logs/                 # 日志目录 (运行时生成)
 │   ├── bot.log           # 主日志
 │   ├── trades.log        # 交易流水
@@ -168,12 +232,14 @@ polymarket-copy-bot-new/
 
 ## WebSocket 支持
 
-支持实时市场数据订阅：
+支持实时市场数据订阅（可选）：
 
-- `subscribe_market()` - 市场更新
-- `subscribe_orderbook()` - 订单簿更新
-- `subscribe_trades()` - 交易流
-- `subscribe_user_orders()` - 用户订单
+- 市场更新
+- 订单簿更新
+- 交易流
+- 用户订单
+
+在 `.env` 中配置 `WEBSOCKET_ENABLED=true` 启用。
 
 ## 安全注意事项
 
@@ -186,9 +252,62 @@ polymarket-copy-bot-new/
 
 - Python 3.10+
 - web3 >= 6.0.0
+- eth_account >= 0.10.0  # L2 API 签名
 - aiohttp >= 3.9.0
 - pydantic >= 2.0.0
 - python-dotenv >= 1.0.0
+
+## 如何使用
+
+### 安装
+
+```bash
+# 安装依赖
+pip install -r requirements.txt
+
+# 配置环境变量
+cp .env.example .env
+nano .env
+```
+
+### 配置
+
+编辑 `.env` 文件，填写以下必需配置：
+
+```env
+# 必需配置
+PRIVATE_KEY=your_private_key_here
+WALLET_ADDRESS=0xYourWalletAddress
+POLYGON_RPC_URL=https://polygon-rpc.com
+POLYGONSCAN_API_KEY=your_api_key_here
+```
+
+### 运行
+
+```bash
+# 模拟模式（推荐首次运行）
+python main.py --dry-run
+
+# 实盘模式
+python main.py
+```
+
+### 跟单配置
+
+在 `.env` 中配置跟单参数：
+
+- `COPY_TRADING_MODE` - 跟单模式
+- `COPY_MAX_AMOUNT` - 最大跟单金额
+- `COPY_FOLLOW_CLOSE` - 是否跟平仓（推荐开启）
+- `COPY_CLOSE_ON_TARGET_CLOSE` - 目标平仓时自动平仓（推荐开启）
+
+### 风险管理配置
+
+- `MAX_DAILY_LOSS` - 每日最大损失（熔断触发）
+- `MAX_POSITION_SIZE` - 单笔最大仓位
+- `MAX_CONCURRENT_POSITIONS` - 最大并发仓位数
+
+
 
 ## ⚠️ 交易风险提示
 
@@ -246,10 +365,10 @@ polymarket-copy-bot-new/
 
 ### 紧急停止
 
-创建 `EMERGENCY_STOP` 文件可触发紧急停止：
+创建 `EMERGENCY_STOP` 文件可触发紧急停止并强制平仓所有持仓：
 
 ```bash
-# 紧急停止（会强制平仓所有持仓）
+# 触发紧急停止
 echo "紧急停止原因" > EMERGENCY_STOP
 
 # 恢复运行
