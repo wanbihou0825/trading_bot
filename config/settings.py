@@ -114,6 +114,12 @@ class CopyTradingConfig:
     min_amount: Decimal = Decimal("5")
     # 跟单延迟(秒)
     copy_delay_seconds: float = 1.0
+    # 是否跟平仓 (避免持仓失控的关键配置)
+    follow_close: bool = True
+    # 目标平仓时自动平仓
+    close_on_target_close: bool = True
+    # 持仓同步间隔(秒)
+    position_sync_interval: int = 300
     # 目标钱包列表 (可选，auto_discover=True时可留空)
     target_wallets: List[str] = field(default_factory=list)
 
@@ -217,9 +223,14 @@ class Settings:
             mode=os.getenv("COPY_TRADING_MODE", "smart"),
             fixed_amount=Decimal(os.getenv("COPY_FIXED_AMOUNT", "10")),
             max_amount=Decimal(os.getenv("COPY_MAX_AMOUNT", "50")),
+            min_amount=Decimal(os.getenv("COPY_MIN_AMOUNT", "5")),
             copy_delay_seconds=float(os.getenv("COPY_DELAY_SECONDS", "1.0")),
+            proportional_ratio=Decimal(os.getenv("COPY_PROPORTIONAL_RATIO", "0.1")),
+            follow_close=os.getenv("COPY_FOLLOW_CLOSE", "true").lower() == "true",
+            close_on_target_close=os.getenv("COPY_CLOSE_ON_TARGET_CLOSE", "true").lower() == "true",
+            position_sync_interval=int(os.getenv("COPY_POSITION_SYNC_INTERVAL", "300")),
         )
-        
+
         # 加载目标钱包列表
         wallets_str = os.getenv("TARGET_WALLETS", "")
         if wallets_str:

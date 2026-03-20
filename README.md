@@ -18,7 +18,11 @@
 - **WebSocket 支持** - 实时市场数据推送
 - **风险管理** - 止损止盈、仓位控制、熔断保护
 - **Telegram 通知** - 交易提醒和状态报告
-- **交易持久化** - SQLite 存储，重启后不重复跟单
+- **交易持久化** - SQLite 存储，幂等性保证
+  - ✅ 防止重复跟单（重启后不重复处理已跟单的交易）
+  - ✅ 完整跟单历史记录
+  - ✅ 持仓状态持久化
+  - ✅ WAL 模式支持高并发
 
 ### 钱包质量评估
 
@@ -37,27 +41,29 @@
 
 ## 快速开始
 
-### 安装
+### 安装依赖
+
+运行命令安装所有依赖：
 
 ```bash
-# 克隆项目
-git clone https://github.com/yourusername/polymarket-copy-bot.git
-cd polymarket-copy-bot
-
-# 安装依赖
 pip install -r requirements.txt
-
-# 配置环境变量
-cp .env.example .env
-nano .env
 ```
 
-### 必需配置
+### 配置环境变量
+
+复制示例配置文件并填写实际值：`cp .env.example .env`，然后编辑 `.env` 文件。
+
+### 必需配置项
 
 - `PRIVATE_KEY` - 钱包私钥（用于 L2 API 认证）
 - `WALLET_ADDRESS` - 钱包地址
-- `POLYGON_RPC_URL` - Polygon RPC端点
-- `POLYGONSCAN_API_KEY` - Polygonscan API密钥 (跟单功能)
+- `POLYGON_RPC_URL` - Polygon RPC 端点
+- `POLYGONSCAN_API_KEY` - Polygonscan API 密钥（跟单功能必需）
+
+### 运行
+
+- 模拟模式（推荐首次运行）：`python main.py --dry-run`
+- 实盘模式：`python main.py`
 
 ### Polymarket API 说明
 
@@ -68,20 +74,36 @@ nano .env
 3. **CLOB API** (`https://clob.polymarket.com`) - 交易执行（需 L2 认证）
 
 **L2 API 认证流程**：
-- 客户端会自动使用私钥签名
-- 调用 `/auth/api-key` 端点派生 credentials
-- 后续请求自动添加认证头
-- 无需手动配置 apiKey/secret/passphrase
+
+#### 阶段一：派生 Credentials（身份认证）
+1. 构造认证消息：固定格式，包含 nonce 和 timestamp
+2. 使用私钥签名：EIP-191 标准签名方法
+3. 发送到 CLOB API：`/auth/api-key` 端点
+4. 获取 credentials：返回 apiKey、secret、passphrase
+
+#### 阶段二：签名 API 请求（防篡改）
+1. 构造签名字符串：`{timestamp}{method}{path}{body}`
+2. HMAC-SHA256 签名：使用 secret 对消息签名
+3. 添加请求头：POLY-API-KEY、POLY-SIGNATURE、POLY-TIMESTAMP、POLY-PASSPHRASE
+
+**关键说明**：
+- ✅ 客户端会自动使用私钥签名
+- ✅ 调用 `/auth/api-key` 端点派生 credentials
+- ✅ 后续请求自动添加认证头
+- ❌ **无需手动配置** apiKey/secret/passphrase
+- ❌ **Private Key 不直接签名区块链交易**（仅用于 API 认证）
+- ✅ **实际的区块链交易由 Polymarket 后台处理**
+
+**Private Key 的作用**：
+1. **身份认证** - 证明你拥有该钱包
+2. **派生 credentials** - 获取 API 访问权限
+3. **签名认证请求** - 防止请求被篡改
+4. ❌ **不负责**：直接签名区块链交易、代币转移、智能合约调用
 
 ### 运行
 
-```bash
-# 模拟模式 (推荐首次运行)
-python main.py --dry-run
-
-# 实盘模式
-python main.py
-```
+- 模拟模式（推荐首次运行）：`python main.py --dry-run`
+- 实盘模式：`python main.py`
 
 ## 策略说明
 
@@ -112,25 +134,51 @@ python main.py
 
 ## 跟单配置
 
-### 添加目标钱包
+### 配置项列表
 
-在 `.env` 文件中配置：
+| 配置项 | 默认值 | 说明 |
+|--------|---------|------|
+| `COPY_TRADING_ENABLED` | `true` | 是否启用跟单 |
+| `COPY_AUTO_DISCOVER` | `true` | 自动发现高质量钱包（无需手动配置） |
+| `COPY_MAX_WALLETS` | `10` | 最大跟单钱包数 |
+| `TARGET_WALLETS` | 空 | 目标钱包列表（逗号分隔，auto_discover=False 时使用） |
+| `COPY_TRADING_MODE` | `smart` | 跟单模式：`smart`/`fixed`/`proportional`/`full` |
+| `COPY_FIXED_AMOUNT` | `10` | 固定金额模式下的跟单金额 (USD) |
+| `COPY_PROPORTIONAL_RATIO` | `0.1` | 比例跟单模式下的跟单比例（如 0.1 = 10%） |
+| `COPY_MAX_AMOUNT` | `50` | 单笔跟单最大金额 (USD) |
+| `COPY_MIN_AMOUNT` | `5` | 单笔跟单最小金额 (USD) |
+| `COPY_DELAY_SECONDS` | `1.0` | 跟单延迟 (秒) |
+| `COPY_FOLLOW_CLOSE` | `true` | 是否跟平仓（避免持仓失控） |
+| `COPY_CLOSE_ON_TARGET_CLOSE` | `true` | 目标平仓时自动平仓 |
+| `COPY_POSITION_SYNC_INTERVAL` | `300` | 持仓同步间隔（秒） |
+| `TRADE_DB_PATH` | `data/trades.db` | 交易数据库路径（用于幂等性和历史记录） |
 
-```env
-# 目标钱包列表 (逗号分隔)
-TARGET_WALLETS=0xWallet1,0xWallet2,0xWallet3
+### 配置说明
 
-# 跟单模式
-COPY_TRADING_MODE=smart
+编辑 `.env` 文件，根据需求配置以下参数：
 
-# 最大跟单金额
-COPY_MAX_AMOUNT=50
+**基础配置**：
+- `COPY_TRADING_ENABLED` - 是否启用跟单
+- `COPY_AUTO_DISCOVER` - 自动发现高质量钱包
 
-# 跟单模式配置
-COPY_FOLLOW_CLOSE=true              # 是否跟平仓
-COPY_CLOSE_ON_TARGET_CLOSE=true     # 目标平仓时自动平仓
-COPY_POSITION_SYNC_INTERVAL=300    # 持仓同步间隔(秒)
-```
+**跟单模式**：
+- `COPY_TRADING_MODE` - 选择模式：`smart`（智能）、`fixed`（固定金额）、`proportional`（比例）、`full`（全额）
+
+**金额配置**：
+- `COPY_FIXED_AMOUNT` - 固定金额模式下的跟单金额
+- `COPY_PROPORTIONAL_RATIO` - 比例跟单模式下的跟单比例（如 0.1 = 10%）
+- `COPY_MAX_AMOUNT` - 单笔跟单最大金额
+- `COPY_MIN_AMOUNT` - 单笔跟单最小金额
+- `COPY_DELAY_SECONDS` - 跟单延迟（秒）
+
+**平仓跟单（关键配置）**：
+- `COPY_FOLLOW_CLOSE` - 是否跟平仓（推荐开启）
+- `COPY_CLOSE_ON_TARGET_CLOSE` - 目标平仓时自动平仓（推荐开启）
+- `COPY_POSITION_SYNC_INTERVAL` - 持仓同步间隔（秒）
+
+**钱包配置**：
+- `COPY_MAX_WALLETS` - 最多跟单钱包数
+- `TARGET_WALLETS` - 手动指定目标钱包（逗号分隔，auto_discover=False 时使用）
 
 ### 平仓跟单说明
 
@@ -146,6 +194,11 @@ COPY_POSITION_SYNC_INTERVAL=300    # 持仓同步间隔(秒)
 - `COPY_FOLLOW_CLOSE=true` - 启用平仓跟单
 - `COPY_CLOSE_ON_TARGET_CLOSE=true` - 目标平仓时自动平仓
 - `COPY_POSITION_SYNC_INTERVAL=300` - 每5分钟检查一次持仓同步
+
+**三种平仓触发方式**：
+1. **实时跟平仓** - 目标钱包平仓时立即跟随
+2. **定期同步** - 每 `COPY_POSITION_SYNC_INTERVAL` 秒检查目标持仓
+3. **遗漏检测** - 发现目标已平但我们还持有，自动平仓
 
 ### 钱包质量等级
 
@@ -168,67 +221,22 @@ COPY_POSITION_SYNC_INTERVAL=300    # 持仓同步间隔(秒)
 | < $10k | 2% | 低流动性，+100% + 警告 |
 
 **配置项**：
-```env
-# 滑点配置
-MAX_SLIPPAGE=0.01                 # 默认最大滑点 1%
-MAX_PRICE_DEVIATION=0.03          # 默认价格偏差 3%
-SLIPPAGE_MIN_LIQUIDITY=10000     # 最小流动性 $10k
-SLIPPAGE_DYNAMIC=true             # 启用动态调整
-```
+- `MAX_SLIPPAGE` - 默认最大滑点 1%
+- `MAX_PRICE_DEVIATION` - 默认价格偏差 3%
+- `SLIPPAGE_MIN_LIQUIDITY` - 最小流动性 $10k
+- `SLIPPAGE_DYNAMIC` - 启用动态调整
 
 ## 目录结构
 
-```
-polymarket-copy-bot-new/
-├── config/               # 配置管理
-│   └── settings.py       # 主配置
-├── core/                 # 核心功能
-│   ├── exceptions.py     # 异常定义
-│   ├── circuit_breaker.py # 熔断器
-│   ├── risk_manager.py   # 风险管理
-│   ├── wallet_quality_scorer.py  # 钱包评分
-│   ├── market_maker_detector.py  # 做市商检测
-│   ├── red_flag_detector.py      # 警告检测
-│   ├── wallet_monitor.py         # 钱包监控
-│   ├── wallet_scanner.py         # 钱包扫描器
-│   ├── websocket_manager.py      # WebSocket
-│   └── copy_executor.py          # 跟单执行 (含平仓逻辑)
-├── strategies/           # 交易策略
-│   ├── base.py           # 策略基类
-│   ├── endgame.py        # Endgame策略
-│   └── adaptive.py       # 自适应管理器
-├── services/             # 外部服务
-│   ├── polymarket_client.py  # API客户端 (L2认证+Data API)
-│   └── telegram_service.py   # 通知服务
-├── utils/                # 工具函数
-│   ├── logger.py         # 日志系统
-│   ├── validation.py     # 验证工具
-│   ├── financial.py      # 财务计算
-│   ├── retry.py          # 重试机制 (tenacity)
-│   ├── emergency_stop.py # 紧急停止+强制平仓
-│   ├── structured_logging.py  # 结构化日志
-│   ├── monitoring.py     # 监控告警
-│   ├── multi_provider.py # 多RPC/WS failover
-│   ├── gas_nonce.py      # Nonce管理+Gas优化
-│   ├── slippage_protection.py  # Slippage保护 (动态调整)
-│   └── trade_persistence.py     # 交易持久化 (SQLite)
-├── tests/                # 测试套件
-│   ├── conftest.py       # pytest配置+fixtures
-│   ├── test_risk_manager.py    # 风险管理测试
-│   ├── test_polymarket_client.py  # 客户端测试
-│   ├── test_copy_executor.py  # 跟单执行测试
-│   └── test_integration.py    # 集成测试
-├── data/                 # 数据目录 (运行时生成)
-│   └── trades.db        # SQLite 交易数据库
-├── logs/                 # 日志目录 (运行时生成)
-│   ├── bot.log           # 主日志
-│   ├── trades.log        # 交易流水
-│   └── audit.log         # 审计日志
-├── main.py               # 主入口
-├── pytest.ini            # 测试配置
-├── requirements.txt      # 依赖列表
-└── README.md             # 说明文档
-```
+- `config/` - 配置管理
+- `core/` - 核心功能（风险管理、钱包评分、跟单执行等）
+- `strategies/` - 交易策略
+- `services/` - 外部服务（API 客户端、Telegram 通知）
+- `utils/` - 工具函数（日志、验证、重试等）
+- `tests/` - 测试套件
+- `data/` - 数据目录（运行时生成，包含 SQLite 数据库）
+- `logs/` - 日志目录（运行时生成）
+- `main.py` - 主入口
 
 ## WebSocket 支持
 
@@ -261,45 +269,21 @@ polymarket-copy-bot-new/
 
 ### 安装
 
-```bash
-# 安装依赖
-pip install -r requirements.txt
+使用 pip 安装依赖：
 
-# 配置环境变量
-cp .env.example .env
-nano .env
+```bash
+pip install -r requirements.txt
 ```
 
 ### 配置
 
-编辑 `.env` 文件，填写以下必需配置：
-
-```env
-# 必需配置
-PRIVATE_KEY=your_private_key_here
-WALLET_ADDRESS=0xYourWalletAddress
-POLYGON_RPC_URL=https://polygon-rpc.com
-POLYGONSCAN_API_KEY=your_api_key_here
-```
+1. 复制示例配置文件：`cp .env.example .env`
+2. 编辑 `.env` 文件，填写必需配置项
 
 ### 运行
 
-```bash
-# 模拟模式（推荐首次运行）
-python main.py --dry-run
-
-# 实盘模式
-python main.py
-```
-
-### 跟单配置
-
-在 `.env` 中配置跟单参数：
-
-- `COPY_TRADING_MODE` - 跟单模式
-- `COPY_MAX_AMOUNT` - 最大跟单金额
-- `COPY_FOLLOW_CLOSE` - 是否跟平仓（推荐开启）
-- `COPY_CLOSE_ON_TARGET_CLOSE` - 目标平仓时自动平仓（推荐开启）
+- 模拟模式（推荐首次运行）：`python main.py --dry-run`
+- 实盘模式：`python main.py`
 
 ### 风险管理配置
 
@@ -367,13 +351,8 @@ python main.py
 
 创建 `EMERGENCY_STOP` 文件可触发紧急停止并强制平仓所有持仓：
 
-```bash
-# 触发紧急停止
-echo "紧急停止原因" > EMERGENCY_STOP
-
-# 恢复运行
-rm EMERGENCY_STOP
-```
+- **触发紧急停止**：在项目目录创建 `EMERGENCY_STOP` 文件（内容为停止原因）
+- **恢复运行**：删除 `EMERGENCY_STOP` 文件
 
 ### 免责声明
 

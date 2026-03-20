@@ -198,6 +198,9 @@ class TradingBot:
             min_amount=self.settings.copy_trading.min_amount,
             copy_delay_seconds=self.settings.copy_trading.copy_delay_seconds,
             enabled=self.settings.copy_trading.enabled,
+            follow_close=self.settings.copy_trading.follow_close,
+            close_on_target_close=self.settings.copy_trading.close_on_target_close,
+            position_sync_interval=self.settings.copy_trading.position_sync_interval,
         )
         
         self.copy_executor = CopyExecutor(
