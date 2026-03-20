@@ -99,7 +99,41 @@ class TradingBot:
             f"钱包: {mask_wallet_address(settings.wallet_address)} | "
             f"跟单: {'启用' if settings.copy_trading.enabled else '禁用'}"
         )
-    
+
+    def _get_signature_type(self):
+        """
+        确定签名类型
+
+        优先级:
+        1. 如果显式配置了 POLYMARKET_SIGNATURE_TYPE，使用该值
+        2. 如果配置了 FUNDER_ADDRESS，使用 Gnosis Safe (type=2)
+        3. 否则使用 EOA (type=0)
+
+        说明:
+        - 大多数通过 MetaMask 等浏览器钱包登录 Polymarket 的用户使用 Proxy Wallet
+        - FUNDER_ADDRESS 应该从 polymarket.com/settings 获取
+        """
+        from services.polymarket_client import SignatureType
+
+        # 1. 优先使用显式配置的签名类型
+        if self.settings.polymarket_signature_type is not None:
+            sig_type = self.settings.polymarket_signature_type
+            logger.info(f"使用显式配置的签名类型: {sig_type}")
+            # 将整数转换为 SignatureType 枚举
+            for st in SignatureType:
+                if st.value == sig_type:
+                    return st
+            logger.warning(f"未知的签名类型: {sig_type}，使用默认值")
+
+        # 2. 如果配置了 funder_address，默认使用 Gnosis Safe 模式
+        if self.settings.funder_address:
+            logger.info(f"检测到 FUNDER_ADDRESS，使用 Gnosis Safe 模式 (type=2)")
+            return SignatureType.POLY_GNOSIS_SAFE
+
+        # 3. 默认使用 EOA 模式
+        logger.info(f"未配置 FUNDER_ADDRESS 或签名类型，使用 EOA 模式 (type=0)")
+        return SignatureType.EOA
+
     def _init_components(self) -> None:
         """初始化所有组件"""
         # 1. 熔断器
@@ -129,6 +163,8 @@ class TradingBot:
         self.client = PolymarketClient(
             private_key=self.settings.private_key,
             wallet_address=self.settings.wallet_address,
+            funder_address=self.settings.funder_address,  # Proxy 地址（资金存放位置）
+            signature_type=self._get_signature_type(),
             dry_run=self.settings.dry_run
         )
         

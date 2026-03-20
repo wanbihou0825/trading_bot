@@ -146,20 +146,25 @@ class WebSocketConfig:
 @dataclass
 class Settings:
     """主配置类"""
-    
+
     # API配置
     polygon_rpc_url: str = ""
     polymarket_api_url: str = "https://clob.polymarket.com"
     polygonscan_api_key: str = ""
-    
+
     # 钱包配置
     private_key: str = ""
-    wallet_address: str = ""
-    
+    wallet_address: str = ""  # EOA 地址（用于签名，通常是 MetaMask 地址）
+    funder_address: str = ""  # Proxy 地址（资金存放地址，从 polymarket.com/settings 获取）
+
+    # Polymarket 签名类型 (0=EOA, 1=Poly Proxy, 2=Gnosis Safe)
+    # 如果留空，会根据 funder_address 自动判断
+    polymarket_signature_type: Optional[int] = None
+
     # Telegram配置 (可选)
     telegram_bot_token: Optional[str] = None
     telegram_chat_id: Optional[str] = None
-    
+
     # 运行模式
     dry_run: bool = True  # 默认干运行模式
     
@@ -186,6 +191,8 @@ class Settings:
             polygonscan_api_key=os.getenv("POLYGONSCAN_API_KEY", ""),
             private_key=os.getenv("PRIVATE_KEY", ""),
             wallet_address=os.getenv("WALLET_ADDRESS", ""),
+            funder_address=os.getenv("FUNDER_ADDRESS", ""),  # Proxy 地址
+            polymarket_signature_type=int(os.getenv("POLYMARKET_SIGNATURE_TYPE", "-1")) if os.getenv("POLYMARKET_SIGNATURE_TYPE") else None,
             telegram_bot_token=os.getenv("TELEGRAM_BOT_TOKEN"),
             telegram_chat_id=os.getenv("TELEGRAM_CHAT_ID"),
             dry_run=os.getenv("DRY_RUN", "true").lower() == "true",

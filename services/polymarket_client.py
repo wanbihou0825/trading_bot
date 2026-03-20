@@ -115,38 +115,60 @@ class PolymarketClient:
         self,
         private_key: str = "",
         wallet_address: str = "",
-        signature_type: SignatureType = SignatureType.EOA,
+        signature_type: SignatureType = SignatureType.POLY_GNOSIS_SAFE,  # 默认使用 Gnosis Safe proxy
+        funder_address: str = "",  # Proxy wallet 地址（资金存放地址）
         dry_run: bool = True,
         chain_id: int = 137,  # Polygon Mainnet
     ):
         """
         初始化客户端
-        
+
         Args:
-            private_key: 钱包私钥 (用于派生 API credentials)
-            wallet_address: 钱包地址
-            signature_type: 签名类型
+            private_key: 钱包私钥 (用于派生 API credentials，通常是 MetaMask EOA 私钥)
+            wallet_address: 签名地址 (通常是 MetaMask EOA 地址，用于签名)
+            signature_type: 签名类型 (默认 2 = Gnosis Safe Proxy)
+            funder_address: Proxy wallet 地址 (资金存放地址，从 polymarket.com/settings 获取)
             dry_run: 是否为模拟模式
             chain_id: 链 ID (Polygon = 137)
+
+        重要说明:
+        - 大多数 Polymarket 用户使用 Gnosis Safe Proxy Wallet
+        - signature_type=2 对应 Gnosis Safe (通过浏览器钱包创建的 1-of-1 proxy 合约)
+        - WALLET_ADDRESS 应该是 EOA 地址 (MetaMask 地址)
+        - FUNDER_ADDRESS 应该是 Proxy 地址 (polymarket.com/settings 显示的地址)
+        - 资金（USDC、仓位）存放在 Proxy 地址，不是 EOA 地址
         """
         self.private_key = private_key
         self.wallet_address = wallet_address.lower() if wallet_address else ""
         self.signature_type = signature_type
+        self.funder_address = funder_address.lower() if funder_address else self.wallet_address
         self.dry_run = dry_run
         self.chain_id = chain_id
-        
+
         # API sessions
         self._session: Optional[aiohttp.ClientSession] = None
         self._is_connected = False
-        
+
         # L2 API credentials (用于 CLOB 交易)
         self._credentials: Optional[ApiCredentials] = None
-        
+
+        # 日志显示地址信息
+        eoa_addr = wallet_address[:10] + "..." if wallet_address else "N/A"
+        proxy_addr = self.funder_address[:10] + "..." if self.funder_address else eoa_addr
+
         logger.info(
             f"Polymarket客户端初始化 | "
             f"模式: {'模拟' if dry_run else '实盘'} | "
-            f"钱包: {wallet_address[:10] if wallet_address else 'N/A'}..."
+            f"签名类型: {signature_type.name} ({signature_type.value}) | "
+            f"EOA地址: {eoa_addr} | "
+            f"Proxy地址: {proxy_addr}"
         )
+
+        if signature_type == SignatureType.POLY_GNOSIS_SAFE:
+            logger.info(
+                "✓ 使用 Gnosis Safe Proxy 模式\n"
+                "  资金存放在 Proxy 地址，交易 gasless 执行"
+            )
     
     # ═══════════════════════════════════════════════════════════════
     # 连接管理
@@ -157,36 +179,67 @@ class PolymarketClient:
         self._session = aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=30)
         )
-        
+
         # Dry run 模式
         if self.dry_run:
             self._is_connected = True
             logger.info("[模拟] Polymarket API 连接成功 (模拟模式)")
             return True
-        
+
         # 实盘模式: 派生 L2 credentials
         try:
+            # 先验证配置
+            if not self.private_key:
+                raise ValueError("未配置私钥 (PRIVATE_KEY)")
+            if not self.wallet_address:
+                raise ValueError("未配置钱包地址 (WALLET_ADDRESS)")
+
+            logger.info("开始连接 Polymarket API...")
+
+            # 验证私钥格式
+            from eth_account import Account
+            try:
+                account = Account.from_key(self.private_key)
+                logger.info(f"✓ 私钥验证成功")
+                logger.info(f"✓ 私钥对应地址: {account.address}")
+
+                if account.address.lower() != self.wallet_address.lower():
+                    raise ValueError(
+                        f"私钥地址与配置地址不匹配!\n"
+                        f"私钥地址: {account.address}\n"
+                        f"配置地址: {self.wallet_address}\n"
+                        f"请检查 .env 文件中的 WALLET_ADDRESS 和 PRIVATE_KEY"
+                    )
+            except Exception as e:
+                raise ValueError(f"私钥格式错误: {e}")
+
             # 测试 Gamma API 连接
+            logger.info("测试 Gamma API 连接...")
             async with self._session.get(
                 f"{PolymarketAPI.GAMMA_API}/markets?limit=1"
             ) as response:
                 if response.status != 200:
                     raise ConnectionError(f"Gamma API 连接失败: {response.status}")
-            
+                logger.info("✓ Gamma API 连接成功")
+
             # 派生 L2 API credentials
-            if self.private_key and self.wallet_address:
-                self._credentials = await self._derive_api_credentials()
-                if self._credentials:
-                    logger.info("L2 API credentials 派生成功")
-                else:
-                    raise RuntimeError("无法派生 L2 API credentials")
-            
+            logger.info("派生 L2 API credentials...")
+            self._credentials = await self._derive_api_credentials()
+            if not self._credentials:
+                raise RuntimeError("无法派生 L2 API credentials")
+
             self._is_connected = True
-            logger.info("Polymarket API 连接成功")
+            logger.info("✓ Polymarket API 连接成功")
             return True
-            
+
+        except ValueError as e:
+            logger.error(f"配置错误: {e}")
+            logger.error("请检查 .env 文件中的配置")
+            return False
         except Exception as e:
             logger.error(f"连接失败: {e}")
+            import traceback
+            logger.error(f"异常详情:\n{traceback.format_exc()}")
             return False
     
     async def disconnect(self) -> None:
@@ -214,30 +267,42 @@ class PolymarketClient:
         通过 wallet 签名派生 apiKey, secret, passphrase
         """
         try:
-            # 1. 生成 nonce/timestamp
+            # 1. 生成 timestamp
             timestamp = int(time.time())
-            nonce = f"{timestamp}-{self.wallet_address[:8]}"
             
-            # 2. 创建签名消息
-            message = self._create_auth_message(nonce)
+            # 2. 创建签名消息（符合 Polymarket 规范）
+            message = f"Authentication for Polymarket CLOB.\nTimestamp: {timestamp}"
             
             # 3. 使用私钥签名
             signature = await self._sign_message(message)
             
             # 4. 调用 CLOB API 获取 credentials
             payload = {
-                "message": message,
                 "signature": signature,
-                "wallet": self.wallet_address,
+                "address": self.wallet_address,
                 "timestamp": timestamp,
                 "signatureType": self.signature_type.value,
-                "chainId": self.chain_id,
+                "chainId": str(self.chain_id),
+            }
+
+            # 如果是 Gnosis Safe 模式，添加 funder 参数
+            if self.signature_type == SignatureType.POLY_GNOSIS_SAFE and self.funder_address:
+                payload["funder"] = self.funder_address
+                logger.info(f"使用 Proxy 地址作为 funder: {self.funder_address[:10]}...")
+            
+            # 添加必要的请求头
+            headers = {
+                "Content-Type": "application/json",
+                "Accept": "application/json",
             }
             
             async with self._session.post(
                 f"{PolymarketAPI.CLOB_API}/auth/api-key",
-                json=payload
+                json=payload,
+                headers=headers
             ) as response:
+                response_text = await response.text()
+                
                 if response.status == 200:
                     data = await response.json()
                     credentials = ApiCredentials(
@@ -248,12 +313,18 @@ class PolymarketClient:
                     logger.info(f"API credentials 派生成功: {credentials.api_key[:8]}...")
                     return credentials
                 else:
-                    error_text = await response.text()
-                    logger.error(f"派生 credentials 失败: {response.status} - {error_text}")
+                    logger.error(f"派生 credentials 失败: {response.status} - {response_text}")
+                    
+                    # 额外日志帮助调试
+                    logger.error(f"请求 payload: {payload}")
+                    logger.error(f"签名消息: {message}")
+                    logger.error(f"钱包地址: {self.wallet_address}")
                     return None
                     
         except Exception as e:
             logger.error(f"派生 API credentials 异常: {e}")
+            import traceback
+            logger.error(f"异常堆栈: {traceback.format_exc()}")
             return None
     
     def _create_auth_message(self, nonce: str) -> str:
@@ -269,14 +340,30 @@ class PolymarketClient:
         try:
             from eth_account import Account
             from eth_account.messages import encode_defunct
-            
+
             # 使用 eth_account 签名
             account = Account.from_key(self.private_key)
+
+            # 添加信息日志（改为 INFO 级别）
+            logger.info(f"签名消息: {message}")
+            logger.info(f"从私钥推导的地址: {account.address}")
+            logger.info(f"配置的钱包地址: {self.wallet_address}")
+
+            # 验证钱包地址是否匹配
+            if account.address.lower() != self.wallet_address.lower():
+                logger.warning(
+                    f"⚠️ 私钥地址与配置地址不匹配!\n"
+                    f"私钥地址: {account.address}\n"
+                    f"配置地址: {self.wallet_address}"
+                )
+
             encoded_message = encode_defunct(text=message)
             signed = account.sign_message(encoded_message)
-            
+
+            logger.info(f"签名结果: {signed.signature.hex()[:20]}...")
+
             return signed.signature.hex()
-            
+
         except ImportError as e:
             logger.error(f"eth_account 未安装，无法签名: {e}")
             raise RuntimeError(
@@ -285,6 +372,8 @@ class PolymarketClient:
             ) from e
         except Exception as e:
             logger.error(f"签名失败: {e}")
+            import traceback
+            logger.error(f"签名异常堆栈: {traceback.format_exc()}")
             raise
 
     def _sign_request(
@@ -842,20 +931,52 @@ class PolymarketClient:
             return None
     
     async def get_account_balance(self) -> Optional[Decimal]:
-        """获取账户余额"""
+        """
+        获取账户余额
+
+        注意:
+        - Gnosis Safe 模式下，余额存放在 Proxy 地址（funder_address）
+        - EOA 模式下，余额存放在钱包地址（wallet_address）
+        - 如果未连接或认证失败，返回 None
+        """
         if self.dry_run:
             return Decimal("1000")
-        
+
+        # 检查连接状态
+        if not self._is_connected or not self._session:
+            logger.warning("未连接到 Polymarket API，无法获取余额")
+            return None
+
         # 通过 CLOB API 获取余额
+        # 如果是 Gnosis Safe 模式，使用 funder 作为查询参数
+        address_to_query = self.funder_address if self.signature_type == SignatureType.POLY_GNOSIS_SAFE else self.wallet_address
+
+        logger.debug(f"查询余额地址: {address_to_query[:10]}...")
+
         headers = self._sign_request("GET", "/balance")
-        
-        async with self._session.get(
-            f"{PolymarketAPI.CLOB_API}/balance",
-            headers=headers
-        ) as response:
-            if response.status == 200:
-                data = await response.json()
-                return Decimal(str(data.get("balance", 0)))
+
+        # 构建查询参数
+        params = {}
+        if address_to_query != self.wallet_address:
+            params["funder"] = address_to_query
+
+        try:
+            async with self._session.get(
+                f"{PolymarketAPI.CLOB_API}/balance",
+                headers=headers,
+                params=params
+            ) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    balance = Decimal(str(data.get("balance", 0)))
+                    logger.info(f"账户余额: ${balance:.2f} (地址: {address_to_query[:10]}...)")
+                    return balance
+                else:
+                    error_text = await response.text()
+                    logger.error(f"获取余额失败: {response.status} - {error_text}")
+                    return None
+        except Exception as e:
+            logger.error(f"获取余额异常: {e}")
             return None
     
     def _generate_mock_markets(self, count: int) -> List[Dict[str, Any]]:
