@@ -2,10 +2,9 @@
 钱包扫描器 - 自动发现高质量可跟单钱包
 
 数据源:
-1. Polymarket 排行榜 (最高质量)
-2. CLOB 市场交易活动 (链上活跃度)
-3. Polygonscan 合约交互 (辅助发现)
-4. 手动种子钱包 (用户指定)
+1. Polymarket 官方排行榜 API (/v1/leaderboard) — 主要数据源
+2. 手动种子钱包 (用户指定)
+3. Polygonscan 合约交互 (辅助, V1 API 已废弃，当前基本不可用)
 
 评分数据: 通过 Data API 获取真实交易记录 (含 pnl/side/market 等字段)
 """
@@ -43,6 +42,7 @@ class WalletScanner:
         min_trades: int = 20,
         min_profit_factor: Decimal = Decimal("1.3"),
         max_following_wallets: int = 10,
+        max_scan_wallets: int = 100,
         scan_interval_minutes: int = 60,
         dry_run: bool = False
     ):
@@ -57,6 +57,7 @@ class WalletScanner:
         self.min_trades = min_trades
         self.min_profit_factor = min_profit_factor
         self.max_following_wallets = max_following_wallets
+        self.max_scan_wallets = max_scan_wallets
         self.scan_interval = scan_interval_minutes * 60
         self.dry_run = dry_run
         
@@ -76,10 +77,12 @@ class WalletScanner:
         self._session: Optional[aiohttp.ClientSession] = None
         self._discovered_wallets: Dict[str, Dict[str, Any]] = {}  # wallet_address -> info
         self._active_wallets: Set[str] = set()  # 当前跟单的钱包
-        self._scanned_wallets: Set[str] = set()  # 已扫描过的钱包
+        self._scanned_wallets: Dict[str, float] = {}  # wallet_address -> last_scan_timestamp
+        self._rescan_interval = 4 * 3600  # 4小时后允许重新扫描已分析的钱包
         self._running = False
         self._scan_task = None  # 扫描任务引用
         self._on_wallet_discovered = None  # 回调函数
+        self._scan_count = 0  # 扫描轮次计数
     
     def set_discovery_callback(self, callback):
         """设置发现新钱包的回调函数"""
@@ -146,186 +149,186 @@ class WalletScanner:
                 await asyncio.sleep(0.5 - elapsed)
             self._last_request_time = time.monotonic()
     
+    def _is_scan_expired(self, wallet: str) -> bool:
+        """检查钱包是否可以重新扫描 (超过 rescan_interval 则允许重扫)"""
+        import time
+        last_scan = self._scanned_wallets.get(wallet)
+        if last_scan is None:
+            return True
+        return (time.monotonic() - last_scan) > self._rescan_interval
+    
     async def _discover_wallets(self):
-        """发现新的高质量钱包 (4个数据源)"""
-        logger.info("开始扫描发现高质量钱包...")
+        """发现并分析排名前 N 的高质量钱包
         
-        # 数据源1 (最高优先级): 手动种子钱包
-        seed_candidates = [w for w in self.seed_wallets if w not in self._scanned_wallets]
+        策略:
+        1. 种子钱包 (最高优先级，始终分析)
+        2. 从 Data API 获取 3000 笔最新交易，按交易次数排名取 Top N
+        3. Polygonscan 合约交互 (辅助补充)
+        4. 合并去重后，只分析排名前 max_scan_wallets 个钱包
+        """
+        import time
+        self._scan_count += 1
+        logger.info(f"开始第 {self._scan_count} 轮扫描 (只分析排名前 {self.max_scan_wallets} 个钱包)...")
         
-        # 数据源2 (高质量): Polymarket 排行榜
-        leaderboard_traders = await self._get_leaderboard_traders()
+        # 数据源1 (最高优先级): 手动种子钱包 (不受排名限制)
+        seed_candidates = [w for w in self.seed_wallets if self._is_scan_expired(w)]
         
-        # 数据源3: CLOB 市场活跃交易者
-        active_traders = await self._get_active_traders_from_markets()
+        # 数据源2 (核心): 从 Data API 3000 笔交易中排名 Top N
+        ranked_traders = await self._get_top_ranked_traders()
         
-        # 数据源4 (辅助): Polygonscan 合约交互者
+        # 数据源3 (辅助): Polygonscan 合约交互者
         contract_interactors = await self._get_contract_interactors()
         
-        # 按优先级合并 (种子 > 排行榜 > 活跃交易 > 合约交互)
-        # 使用有序列表去重，保持优先级
+        # 按优先级合并: 种子 > 排名交易者 > 合约交互
+        # 种子钱包不占排名配额
         seen = set()
         ordered_candidates = []
-        for wallet in seed_candidates + leaderboard_traders + active_traders + contract_interactors:
-            w = wallet.lower()
-            if w not in seen and w not in self._scanned_wallets:
+        
+        # 种子钱包始终优先
+        for w in seed_candidates:
+            w = w.lower()
+            if w not in seen:
                 seen.add(w)
                 ordered_candidates.append(w)
         
+        # 排名交易者 + 合约交互者，限制总数为 max_scan_wallets
+        ranked_count = 0
+        for wallet in ranked_traders + contract_interactors:
+            w = wallet.lower()
+            if w not in seen and self._is_scan_expired(w):
+                seen.add(w)
+                ordered_candidates.append(w)
+                ranked_count += 1
+                if ranked_count >= self.max_scan_wallets:
+                    break
+        
         logger.info(
-            f"发现 {len(ordered_candidates)} 个新钱包待分析 | "
-            f"种子: {len(seed_candidates)} | 排行榜: {len(leaderboard_traders)} | "
-            f"CLOB: {len(active_traders)} | 合约: {len(contract_interactors)}"
+            f"待分析 {len(ordered_candidates)} 个钱包 | "
+            f"种子: {len(seed_candidates)} | "
+            f"排名Top{self.max_scan_wallets}: {len(ranked_traders)} | "
+            f"合约: {len(contract_interactors)} | "
+            f"已缓存: {len(self._scanned_wallets)} | 轮次: {self._scan_count}"
         )
         
-        # 分析新钱包
+        # 当所有源都返回0时，输出诊断提示
+        if not ordered_candidates and not self._active_wallets:
+            logger.warning(
+                "所有发现源返回 0 个钱包。请检查: "
+                "(1) SEED_WALLETS 环境变量是否配置 "
+                "(2) 网络是否能连接 data-api.polymarket.com "
+                "(3) POLYGONSCAN_API_KEY 是否配置"
+            )
+        
+        # 逐个分析候选钱包
+        analyzed = 0
         for wallet in ordered_candidates:
             if not self._running:
                 break
-                
-            if len(self._active_wallets) >= self.max_following_wallets:
-                break
             
             await self._analyze_wallet(wallet)
-            self._scanned_wallets.add(wallet)
-    
-    async def _get_leaderboard_traders(self) -> List[str]:
-        """从 Polymarket 排行榜获取高质量交易者 (最优质数据源)"""
-        if self.dry_run:
-            return self._generate_mock_traders(10)
+            self._scanned_wallets[wallet] = time.monotonic()
+            analyzed += 1
         
-        traders = []
+        # 每 5 轮重新评估已跟单的钱包 (用最新交易数据刷新评分)
+        if self._scan_count % 5 == 0 and self._active_wallets:
+            logger.info(f"第 {self._scan_count} 轮: 重新评估 {len(self._active_wallets)} 个已跟单钱包")
+            for wallet in list(self._active_wallets):
+                if not self._running:
+                    break
+                await self._analyze_wallet(wallet)
+                self._scanned_wallets[wallet] = time.monotonic()
+        
+        if analyzed:
+            logger.info(f"本轮分析了 {analyzed} 个钱包 (排名前 {self.max_scan_wallets})")
+    
+    async def _get_top_ranked_traders(self) -> List[str]:
+        """从 Polymarket 官方排行榜 API 获取排名前 N 的钱包
+        
+        端点: GET /v1/leaderboard (公开，无需认证)
+        策略: 
+        1. 按 PNL 排序取 top 50 (盈利能力最强)
+        2. 按 VOLUME 排序取 top 50 (交易量最大)
+        3. 合并去重，返回排名前 max_scan_wallets 个
+        
+        API 文档: https://docs.polymarket.com/api-reference/core/get-trader-leaderboard-rankings
+        """
+        if self.dry_run:
+            return self._generate_mock_traders(min(self.max_scan_wallets, 25))
         
         try:
             if not self._session:
                 return []
             
-            # Polymarket 排行榜 API (获取盈利最高的交易者)
-            # 尝试多个可能的端点
-            endpoints = [
-                f"{self._data_api}/leaderboard",
-                f"{self._data_api}/rankings",
+            seen = set()
+            ranked_wallets = []  # 保持排名顺序
+            
+            # 请求多个维度的排行榜，合并发现更多高质量钱包
+            queries = [
+                {"category": "OVERALL", "timePeriod": "WEEK", "orderBy": "PNL", "limit": 50},
+                {"category": "OVERALL", "timePeriod": "WEEK", "orderBy": "VOLUME", "limit": 50},
+                {"category": "OVERALL", "timePeriod": "MONTH", "orderBy": "PNL", "limit": 50},
+                {"category": "OVERALL", "timePeriod": "DAY", "orderBy": "PNL", "limit": 50},
             ]
             
-            for url in endpoints:
+            for params in queries:
+                await self._rate_limited_request()
                 try:
-                    await self._rate_limited_request()
                     async with self._session.get(
-                        url,
-                        params={"limit": 50, "period": "all"},
+                        f"{self._data_api}/v1/leaderboard",
+                        params=params,
                         timeout=aiohttp.ClientTimeout(total=15)
                     ) as response:
                         if response.status != 200:
+                            logger.warning(
+                                f"排行榜 API ({params['timePeriod']}/{params['orderBy']}) "
+                                f"返回 HTTP {response.status}"
+                            )
                             continue
                         
                         data = await response.json()
-                        
-                        # 解析排行榜数据 (兼容多种返回格式)
-                        entries = data if isinstance(data, list) else data.get("data", data.get("leaderboard", data.get("rankings", [])))
-                        
-                        if not isinstance(entries, list) or not entries:
+                        if not isinstance(data, list):
                             continue
                         
-                        for entry in entries:
-                            addr = (
-                                entry.get("address")
-                                or entry.get("user")
-                                or entry.get("wallet")
-                                or entry.get("proxyWallet")
-                            )
+                        for entry in data:
+                            addr = entry.get("proxyWallet", "")
                             if addr and addr.startswith("0x"):
-                                traders.append(addr.lower())
+                                addr = addr.lower()
+                                if addr not in seen:
+                                    seen.add(addr)
+                                    ranked_wallets.append(addr)
                         
-                        if traders:
-                            logger.info(f"从排行榜获取 {len(traders)} 个交易者")
-                            return list(set(traders))
-                            
+                        desc = f"{params['timePeriod']}/{params['orderBy']}"
+                        logger.debug(f"排行榜 {desc}: 获取 {len(data)} 名交易者")
+                        
                 except Exception as e:
-                    logger.debug(f"排行榜端点 {url} 失败: {e}")
+                    logger.warning(f"排行榜 API 请求异常: {e}")
                     continue
             
-            # 备选: 从 Activity 端点获取高活跃度钱包
-            if not traders:
-                try:
-                    await self._rate_limited_request()
-                    async with self._session.get(
-                        f"{self._data_api}/activity",
-                        params={"limit": 100},
-                        timeout=aiohttp.ClientTimeout(total=15)
-                    ) as response:
-                        if response.status == 200:
-                            activities = await response.json()
-                            if isinstance(activities, list):
-                                for act in activities:
-                                    addr = act.get("user") or act.get("address")
-                                    if addr and addr.startswith("0x"):
-                                        traders.append(addr.lower())
-                                if traders:
-                                    logger.info(f"从活动端点获取 {len(traders)} 个交易者")
-                except Exception as e:
-                    logger.debug(f"Activity 端点失败: {e}")
+            # 截取前 max_scan_wallets 个
+            result = ranked_wallets[:self.max_scan_wallets]
             
-            return list(set(traders))
+            if result:
+                logger.info(
+                    f"官方排行榜: 获取 {len(ranked_wallets)} 个唯一钱包, "
+                    f"取前 {len(result)} 名"
+                )
+            else:
+                logger.warning("官方排行榜 API 未返回任何钱包")
+            
+            return result
             
         except Exception as e:
             logger.error(f"获取排行榜交易者失败: {e}")
-            return []
-    
-    async def _get_active_traders_from_markets(self) -> List[str]:
-        """从 CLOB 市场交易获取活跃交易者"""
-        if self.dry_run:
-            return self._generate_mock_traders(15)
-        
-        try:
-            url = "https://clob.polymarket.com/markets"
-            
-            if not self._session:
-                return []
-            
-            await self._rate_limited_request()
-            async with self._session.get(url) as response:
-                if response.status != 200:
-                    return []
-                
-                data = await response.json()
-                traders = []
-                
-                markets = data if isinstance(data, list) else data.get("data", data.get("markets", []))
-                if not isinstance(markets, list):
-                    logger.warning(f"markets API 返回非列表类型: {type(markets)}")
-                    return []
-                
-                for market in markets[:20]:
-                    market_id = market.get("condition_id")
-                    if market_id:
-                        await self._rate_limited_request()
-                        history_url = f"https://clob.polymarket.com/trades?market={market_id}"
-                        
-                        try:
-                            async with self._session.get(history_url) as hist_response:
-                                if hist_response.status == 200:
-                                    trades = await hist_response.json()
-                                    # CLOB trades 可能返回 {"data": [...]} 或列表
-                                    trade_list = trades if isinstance(trades, list) else trades.get("data", [])
-                                    for trade in trade_list[:30]:
-                                        # CLOB trades 字段: maker, taker, 或 address
-                                        for field in ["maker", "taker", "address", "user"]:
-                                            addr = trade.get(field)
-                                            if addr and addr.startswith("0x"):
-                                                traders.append(addr.lower())
-                        except Exception as e:
-                            logger.debug(f"获取市场 {market_id[:10]}... 交易失败: {e}")
-                
-                return list(set(traders))
-                
-        except Exception as e:
-            logger.error(f"获取活跃交易者失败: {e}")
             return []
     
     async def _get_contract_interactors(self) -> List[str]:
         """从 Polygonscan 获取与 Polymarket 合约交互的钱包"""
         if self.dry_run:
             return self._generate_mock_traders(10)
+        
+        if not self.polygonscan_api_key:
+            logger.warning("POLYGONSCAN_API_KEY 未配置，跳过合约交互者发现")
+            return []
         
         traders = []
         
@@ -334,7 +337,7 @@ class WalletScanner:
                 return []
             
             for contract_name, contract_addr in self.polymarket_contracts.items():
-                url = f"https://api.polygonscan.com/api"
+                url = "https://api.polygonscan.com/api"
                 params = {
                     "module": "account",
                     "action": "txlist",
@@ -347,17 +350,28 @@ class WalletScanner:
                     "apikey": self.polygonscan_api_key
                 }
                 
-                async with self._session.get(url, params=params) as response:
-                    if response.status == 200:
-                        data = await response.json()
-                        if data.get("status") == "1":
-                            for tx in data.get("result", []):
-                                # 排除合约调用，只保留 EOA
-                                if not tx.get("from", "").startswith("0x"):
-                                    continue
+                await self._rate_limited_request()
+                async with self._session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=15)) as response:
+                    if response.status != 200:
+                        logger.warning(f"Polygonscan API 返回 HTTP {response.status} (合约: {contract_name})")
+                        continue
+                    
+                    data = await response.json()
+                    if data.get("status") == "1":
+                        txs = data.get("result", [])
+                        for tx in txs:
+                            if tx.get("from", "").startswith("0x"):
                                 traders.append(tx["from"].lower())
+                        logger.info(f"Polygonscan {contract_name}: {len(txs)} 笔交易")
+                    else:
+                        msg = data.get('message', 'unknown')
+                        result = data.get('result', '')
+                        logger.warning(f"Polygonscan {contract_name} 返回错误: {msg} - {result}")
             
-            return list(set(traders))
+            unique = list(set(traders))
+            if unique:
+                logger.info(f"从 Polygonscan 获取 {len(unique)} 个唯一交易者")
+            return unique
             
         except Exception as e:
             logger.error(f"获取合约交互者失败: {e}")
@@ -489,76 +503,109 @@ class WalletScanner:
         """
         标准化 Data API 交易数据，确保与 quality_scorer 兼容
         
-        Data API /trades 返回字段 (典型):
-          - id, market, asset, side, size, price, fee,
-          - outcome, timestamp, status, type
+        Data API /trades 实际返回字段:
+          - proxyWallet, side ("BUY"/"SELL"), size, price, outcome,
+          - outcomeIndex, timestamp, transactionHash, conditionId,
+          - title, slug, eventSlug, name, asset
         
         quality_scorer._calculate_stats() 需要的字段:
           - pnl (盈亏)
           - pnl_pct (盈亏百分比)
           - category (市场类别)
           - timestamp (ISO或Unix时间戳)
-          - opened_at / closed_at (持仓时间)
           - hold_hours (持仓小时数)
+        
+        PnL 估算策略 (二元市场):
+          - BUY: 买入成本 = price * size, 潜在最大收益 = (1-price)*size
+            好的买入: price < 0.5 (低价买入=高期望值)
+          - SELL: 卖出收入 = price * size, 估算PnL = (price - 0.5) * size
+            price > 0.5 = 盈利平仓, price < 0.5 = 亏损平仓
         """
         normalized = []
         
         for trade in trades:
             # 提取或计算 PnL
             pnl = trade.get("pnl") or trade.get("profit") or trade.get("realized_pnl")
-            if pnl is None:
-                # 对于买入交易没有直接PnL (需要匹配卖出才能算)
-                # 尝试从 outcome 判断
-                outcome = trade.get("outcome", "").upper()
-                side = trade.get("side", "").upper()
-                price = float(trade.get("price", 0) or 0)
-                size = float(trade.get("size", 0) or 0)
-                
-                if outcome in ["YES", "NO"] and price > 0 and size > 0:
-                    if trade.get("type", "").lower() == "sell":
-                        # 卖出 = 平仓，简化估算PnL
-                        pnl = size * price - size * 0.5  # 粗略估算
+            
+            side = str(trade.get("side", "")).upper()
+            price = float(trade.get("price", 0) or 0)
+            size = float(trade.get("size", 0) or 0)
+            
+            if pnl is None and price > 0 and size > 0:
+                if side == "SELL":
+                    # SELL = 平仓: 估算 PnL = (卖出价 - 假设成本0.5) * size
+                    pnl = (price - 0.5) * size
+                elif side == "BUY":
+                    # BUY = 开仓: 用价格偏离度估算交易质量
+                    # 低价买入(price<0.4): 高期望值 → 正向信号
+                    # 高价买入(price>0.7): 接盘 → 负向信号
+                    # 中间价(0.4-0.7): 中性
+                    if price < 0.35:
+                        pnl = size * 0.15   # 好的入场
+                    elif price > 0.75:
+                        pnl = size * -0.10  # 差的入场 (追高)
                     else:
-                        pnl = 0  # 买入时PnL尚未实现
+                        pnl = size * 0.02   # 中性
                 else:
                     pnl = 0
             
-            pnl = float(pnl)
-            price = float(trade.get("price", 0) or 0)
-            size = float(trade.get("size", 0) or 0)
+            pnl = float(pnl or 0)
             cost = price * size if price > 0 and size > 0 else 1
             pnl_pct = pnl / cost if cost > 0 else 0
             
             # 时间戳标准化
             timestamp = trade.get("timestamp") or trade.get("created_at") or trade.get("time")
-            if isinstance(timestamp, (int, float)) and timestamp > 1e12:
-                # 毫秒级时间戳 → 转ISO
+            if isinstance(timestamp, (int, float)):
                 from datetime import datetime as dt
-                timestamp = dt.fromtimestamp(timestamp / 1000, tz=timezone.utc).isoformat()
-            elif isinstance(timestamp, (int, float)):
-                from datetime import datetime as dt
-                timestamp = dt.fromtimestamp(timestamp, tz=timezone.utc).isoformat()
+                if timestamp > 1e12:
+                    timestamp = dt.fromtimestamp(timestamp / 1000, tz=timezone.utc).isoformat()
+                else:
+                    timestamp = dt.fromtimestamp(timestamp, tz=timezone.utc).isoformat()
             
-            # 市场类别 (Data API 可能不直接提供，使用市场信息估算)
-            category = (
-                trade.get("category")
-                or trade.get("market_category")
-                or trade.get("market_type")
-                or "general"
-            )
+            # 市场类别: 从 title/eventSlug 提取
+            category = trade.get("category") or trade.get("market_category")
+            if not category:
+                category = self._infer_category(trade)
             
             normalized.append({
-                # 原始字段保留
                 **trade,
-                # 评分器需要的标准字段
                 "pnl": pnl,
                 "pnl_pct": pnl_pct,
                 "category": category,
                 "timestamp": timestamp or "",
-                "hold_hours": trade.get("hold_hours", 24),  # 默认24h (Data API通常不提供)
+                "hold_hours": trade.get("hold_hours", 24),
             })
         
         return normalized
+    
+    @staticmethod
+    def _infer_category(trade: Dict[str, Any]) -> str:
+        """从交易的 title/slug/eventSlug 推断市场类别"""
+        text = " ".join([
+            str(trade.get("title", "")),
+            str(trade.get("slug", "")),
+            str(trade.get("eventSlug", "")),
+        ]).lower()
+        
+        if not text.strip():
+            return "general"
+        
+        # 关键词 → 类别映射
+        categories = {
+            "crypto": ["bitcoin", "btc", "eth", "ethereum", "crypto", "token", "defi", "solana", "sol"],
+            "politics": ["president", "election", "trump", "biden", "vote", "congress", "senate", "governor", "political", "democrat", "republican"],
+            "sports": ["nba", "nfl", "mlb", "nhl", "soccer", "football", "basketball", "baseball", "champion", "playoff", "ncaa", "ufc", "fight"],
+            "finance": ["fed", "interest rate", "inflation", "gdp", "stock", "market cap", "s&p", "nasdaq", "recession"],
+            "entertainment": ["oscar", "grammy", "movie", "film", "album", "music", "celebrity", "emmy"],
+            "technology": ["ai", "openai", "gpt", "apple", "google", "meta", "microsoft", "tesla", "spacex"],
+            "world": ["war", "ukraine", "russia", "china", "nato", "un ", "climate", "earthquake"],
+        }
+        
+        for cat, keywords in categories.items():
+            if any(kw in text for kw in keywords):
+                return cat
+        
+        return "general"
     
     async def _maintain_following_list(self):
         """维护跟单钱包列表"""
@@ -647,6 +694,7 @@ class WalletScanner:
         return {
             "total_discovered": len(self._discovered_wallets),
             "active_wallets": len(self._active_wallets),
-            "scanned_wallets": len(self._scanned_wallets),
+            "scanned_wallets_cached": len(self._scanned_wallets),
+            "scan_count": self._scan_count,
             "active_wallet_addresses": list(self._active_wallets),
         }

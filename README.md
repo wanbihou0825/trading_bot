@@ -20,7 +20,7 @@
 ## 功能特性
 
 ### 跟单系统
-- **智能钱包发现** — 4 个数据源自动发现: 排行榜 / CLOB 市场活跃 / Polygonscan / 手动种子
+- **智能钱包发现** — 官方排行榜 API (`/v1/leaderboard`) 自动发现 + 手动种子钱包
 - **5 维质量评分** — 胜率 (20%) + 盈亏比 (25%) + 稳定性 (20%) + 风控 (15%) + 专业度 (20%)
 - **做市商检测** — 6 种模式识别 (高频/短持仓/均衡胜率/低利润/双向/连续报价)
 - **开仓跟单** — 根据钱包评分智能计算跟单金额
@@ -33,7 +33,7 @@
 
 ### 风险管理
 - **仓位控制** — 单笔上限、并发上限、总敞口上限
-- **止损止盈** — 自动止损 15%、止盈 25%
+- **止损止盈** — 自动止损/止盈 (可配置, 默认 15%/25%)
 - **熔断机制** — 日亏损超限自动停止交易
 - **滑点保护** — 订单执行价格偏差检测
 
@@ -45,7 +45,7 @@
 - **连接重试** — Polymarket API 连接失败自动重试 3 次 (指数退避 5s/10s/20s)
 
 ### 监控
-- **Telegram 通知** — 交易提醒 (含源钱包 Polygonscan 链接)、异常告警、定期报告
+- **Telegram 通知** — 交易提醒、异常告警、定期报告
 - **WebSocket 实时推送** — 市场数据和交易事件 (可选, 留空自动回退轮询)
 - **结构化日志** — JSON 格式生产级日志
 
@@ -81,8 +81,8 @@ WALLET_ADDRESS=0xYourWalletAddress
 # 获取: polymarket.com → 头像 → Settings → Wallet Address
 FUNDER_ADDRESS=0xYourProxyAddress
 
-# Polygonscan API Key (钱包扫描用)
-POLYGONSCAN_API_KEY=your_api_key
+# Polygonscan API Key (可选，辅助发现钱包; 核心监控已改用 Data API)
+# POLYGONSCAN_API_KEY=your_api_key
 ```
 
 **可选 — 手动指定跟单目标:**
@@ -121,6 +121,7 @@ python main.py
 | `COPY_MIN_AMOUNT` | `5` | 单笔最小 (USD) |
 | `COPY_DELAY_SECONDS` | `1.0` | 跟单延迟 (秒) |
 | `COPY_MAX_WALLETS` | `10` | 最大跟单钱包数 |
+| `COPY_MAX_SCAN_WALLETS` | `100` | 排行榜扫描钱包数 |
 | `COPY_FOLLOW_CLOSE` | `true` | 跟平仓 (关键!) |
 | `COPY_CLOSE_ON_TARGET_CLOSE` | `true` | 目标平仓时自动跟随平仓 |
 | `COPY_POSITION_SYNC_INTERVAL` | `300` | 持仓同步间隔 (秒) |
@@ -134,7 +135,7 @@ python main.py
 | `WALLET_MIN_TRADES` | `20` | 最小交易次数 |
 | `WALLET_MIN_WIN_RATE` | `0.55` | 最小胜率 (55%) |
 | `WALLET_MIN_PROFIT_FACTOR` | `1.2` | 最小盈亏比 |
-| `WALLET_MIN_QUALITY_SCORE` | `70` | 最小评分 (0-100) |
+| `WALLET_MIN_QUALITY_SCORE` | `7.0` | 最小评分 (0-10, 7.0=expert级) |
 
 ### 钱包质量等级
 
@@ -153,8 +154,8 @@ python main.py
 | `MAX_POSITION_SIZE` | `50` | 单笔上限 (USD) |
 | `MAX_POSITION_PCT` | `0.03` | 仓位占比上限 (3%) |
 | `MAX_CONCURRENT_POSITIONS` | `5` | 最大并发仓位 |
-| `MAX_TOTAL_EXPOSURE` | `200` | 总敞口上限 (USD) |
-
+| `MAX_TOTAL_EXPOSURE` | `200` | 总敞口上限 (USD) || `STOP_LOSS_PCT` | `0.15` | 止损比例 (15%) |
+| `TAKE_PROFIT_PCT` | `0.25` | 止盈比例 (25%) |
 ### Endgame Sweeper
 
 | 环境变量 | 默认值 | 说明 |
@@ -180,7 +181,7 @@ python main.py
 | `TELEGRAM_BOT_TOKEN` | _(空)_ | Bot Token (通过 @BotFather 创建) |
 | `TELEGRAM_CHAT_ID` | _(空)_ | Chat ID (通过 @userinfobot 获取) |
 
-> 配置 Telegram 后，交易通知会包含源钱包的完整地址和 Polygonscan 链接，方便手动验证。
+> 配置 Telegram 后，交易通知会包含源钱包地址和交易详情，方便手动验证。
 
 ## 项目结构
 
@@ -192,8 +193,8 @@ python main.py
 │   ├── copy_executor.py       # 跟单执行 (开仓/平仓/持仓同步)
 │   ├── risk_manager.py        # 风险管理 (仓位/止损止盈/敞口)
 │   ├── circuit_breaker.py     # 熔断机制
-│   ├── wallet_scanner.py      # 钱包发现 (4源: 排行榜/CLOB/Polygonscan/种子)
-│   ├── wallet_monitor.py      # 钱包交易监控 (Polling/WebSocket)
+│   ├── wallet_scanner.py      # 钱包发现 (排行榜API/种子钱包)
+│   ├── wallet_monitor.py      # 钱包交易监控 (Data API 轮询)
 │   ├── wallet_quality_scorer.py # 5维质量评分
 │   ├── market_maker_detector.py # 做市商识别
 │   ├── red_flag_detector.py   # 警告信号检测
@@ -234,10 +235,9 @@ rm EMERGENCY_STOP
 
 | API | 用途 | 认证 |
 |-----|------|------|
-| CLOB (`clob.polymarket.com`) | 交易执行、订单簿 | L2 HMAC (自动派生) |
-| Data (`data-api.polymarket.com`) | 用户交易/持仓/排行榜 | 无 |
-| Gamma (`gamma-api.polymarket.com`) | 市场元数据 | 无 |
-| Polygonscan (`api.polygonscan.com`) | 钱包链上活动 | API Key |
+| CLOB (`clob.polymarket.com`) | 交易执行、订单簿、市场详情 (conditionId) | L2 HMAC (自动派生) |
+| Data (`data-api.polymarket.com`) | 用户交易/持仓/排行榜/钱包监控 | 无 |
+| Gamma (`gamma-api.polymarket.com`) | 市场元数据 (slug查询) | 无 |
 
 ## 风险提示
 

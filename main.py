@@ -266,6 +266,7 @@ class TradingBot:
             min_trades=self.settings.wallet_quality.min_trades,
             min_profit_factor=self.settings.wallet_quality.min_profit_factor,
             max_following_wallets=self.settings.copy_trading.max_following_wallets,
+            max_scan_wallets=self.settings.copy_trading.max_scan_wallets,
             scan_interval_minutes=self.settings.monitoring.wallet_scan_interval // 60,
             dry_run=self.settings.dry_run,
         )
@@ -721,16 +722,16 @@ class TradingBot:
             logger.debug(f"熔断器激活中: {reason}")
             return
         
-        # 获取活跃市场
-        markets = await self.client.get_markets(limit=50)
+        # 获取活跃市场 (已按volume24hr降序排列并过滤低质量市场)
+        markets = await self.client.get_markets(limit=100)
         if not markets:
             logger.debug("未获取到市场数据")
             return
         
-        logger.info(f"扫描了 {len(markets)} 个市场")
+        # 分析所有通过过滤的市场 (get_markets已按volume降序+流动性/订单簿过滤)
+        logger.info(f"扫描 {len(markets)} 个符合条件的市场")
         
-        # 分析每个市场
-        for market_info in markets[:10]:  # 限制处理数量
+        for market_info in markets:
             if self._shutdown_requested:
                 break
             

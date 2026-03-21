@@ -409,6 +409,9 @@ class PolymarketClient:
             params["closed"] = "false"
         if slug:
             params["slug"] = slug
+        # 按24h成交量降序排列，优先获取最活跃的市场
+        params["order"] = "volume24hr"
+        params["ascending"] = "false"
         
         session = self._check_session()
         async with session.get(
@@ -417,13 +420,43 @@ class PolymarketClient:
         ) as response:
             if response.status == 200:
                 data = await response.json()
-                return data if isinstance(data, list) else []
+                if not isinstance(data, list):
+                    return []
+                logger.debug(f"Gamma API 返回 {len(data)} 个原始市场")
+                # 过滤: 仅保留有订单簿、正在接单、且有基本流动性的市场
+                filtered = [
+                    m for m in data
+                    if m.get("enableOrderBook", False)
+                    and m.get("acceptingOrders", False)
+                    and float(m.get("liquidity", 0) or 0) >= 1000
+                    and float(m.get("volume24hr", 0) or 0) >= 100
+                ]
+                logger.debug(f"过滤后剩余 {len(filtered)} 个优质市场")
+                return filtered
+            logger.warning(f"Gamma API 返回状态码: {response.status}")
             return []
     
     @with_retry(max_retries=3, base_delay=1.0)
     async def get_market(self, market_id_or_slug: str) -> Optional[Dict[str, Any]]:
-        """获取单个市场详情"""
+        """获取单个市场详情
+        
+        优先使用 CLOB API (支持 conditionId 查询)，回退到 Gamma API (支持 slug)
+        """
         session = self._check_session()
+        
+        # conditionId 格式 (0x开头) → 使用 CLOB API
+        if market_id_or_slug.startswith("0x"):
+            try:
+                async with session.get(
+                    f"{PolymarketAPI.CLOB_API}/markets/{market_id_or_slug}",
+                    timeout=aiohttp.ClientTimeout(total=10)
+                ) as response:
+                    if response.status == 200:
+                        return await response.json()
+            except Exception:
+                pass
+        
+        # 回退到 Gamma API (slug 或数字 ID)
         async with session.get(
             f"{PolymarketAPI.GAMMA_API}/markets/{market_id_or_slug}"
         ) as response:
@@ -893,9 +926,10 @@ class PolymarketClient:
     # ═══════════════════════════════════════════════════════════════
     
     def parse_market_data(self, market_info: Dict[str, Any]) -> Optional[MarketData]:
-        """解析市场数据"""
+        """解析市场数据 (兼容 mock 格式和 Gamma API 真实格式)"""
         try:
-            end_date = market_info.get("end_date")
+            # --- 解析 end_date (Gamma API: endDate, mock: end_date) ---
+            end_date = market_info.get("endDate") or market_info.get("end_date")
             if end_date:
                 try:
                     end_dt = datetime.fromisoformat(end_date.replace("Z", "+00:00"))
@@ -904,14 +938,38 @@ class PolymarketClient:
                     days_to_resolution = None
             else:
                 days_to_resolution = None
-            
+
+            # --- 解析价格 (Gamma API: outcomePrices JSON字符串, mock: yes_price/no_price) ---
+            yes_price = Decimal("0.5")
+            no_price = Decimal("0.5")
+            outcome_prices_raw = market_info.get("outcomePrices")
+            if outcome_prices_raw:
+                try:
+                    prices = json.loads(outcome_prices_raw) if isinstance(outcome_prices_raw, str) else outcome_prices_raw
+                    if isinstance(prices, list) and len(prices) >= 2:
+                        yes_price = Decimal(str(prices[0]))
+                        no_price = Decimal(str(prices[1]))
+                except Exception:
+                    pass
+            else:
+                yes_price = Decimal(str(market_info.get("yes_price", 0.5)))
+                no_price = Decimal(str(market_info.get("no_price", 0.5)))
+
+            # --- 解析成交量 (Gamma API: volume24hr, mock: volume_24h) ---
+            volume_24h = Decimal(str(
+                market_info.get("volume24hr") or market_info.get("volume_24h", 0)
+            ))
+
+            # --- 解析流动性 ---
+            liquidity = Decimal(str(market_info.get("liquidity", 0)))
+
             return MarketData(
                 market_id=str(market_info.get("id", "")),
                 question=market_info.get("question", ""),
-                yes_price=Decimal(str(market_info.get("yes_price", 0.5))),
-                no_price=Decimal(str(market_info.get("no_price", 0.5))),
-                volume_24h=Decimal(str(market_info.get("volume_24h", 0))),
-                liquidity=Decimal(str(market_info.get("liquidity", 0))),
+                yes_price=yes_price,
+                no_price=no_price,
+                volume_24h=volume_24h,
+                liquidity=liquidity,
                 days_to_resolution=days_to_resolution
             )
         except Exception as e:
@@ -1013,29 +1071,38 @@ class PolymarketClient:
     
     def _generate_mock_markets(self, count: int) -> List[Dict[str, Any]]:
         """生成模拟市场数据"""
+        import random
         from datetime import timedelta
         now = datetime.now(timezone.utc)
         
-        markets = [
-            {
-                "id": "market_endgame_1",
-                "question": "Will the Fed announce rate decision by March 22, 2026?",
-                "yes_price": 0.96,
-                "no_price": 0.04,
-                "volume_24h": 250000,
-                "liquidity": 150000,
-                "end_date": (now + timedelta(days=3)).isoformat(),
-                "active": True,
-            },
-            {
-                "id": "market_endgame_2",
-                "question": "Will Bitcoin drop below $50k before March 25, 2026?",
-                "yes_price": 0.03,
-                "no_price": 0.97,
-                "volume_24h": 500000,
-                "liquidity": 200000,
-                "end_date": (now + timedelta(days=5)).isoformat(),
-                "active": True,
-            },
+        templates = [
+            ("Will the Fed announce rate decision by March 22, 2026?", 0.96, 3),
+            ("Will Bitcoin drop below $50k before March 25, 2026?", 0.03, 5),
+            ("Will ETH reach $5000 by April 2026?", 0.35, 14),
+            ("Will Trump win the 2026 midterms?", 0.62, 30),
+            ("Will inflation drop below 2% by Q2 2026?", 0.45, 21),
+            ("Will the S&P 500 close above 6000 this week?", 0.78, 2),
+            ("Will there be a government shutdown in March 2026?", 0.15, 7),
+            ("Will Solana reach $300 before April?", 0.22, 10),
+            ("Will the UFC 320 main event go to decision?", 0.40, 4),
+            ("Will Apple announce a new product in March 2026?", 0.55, 6),
+            ("Will gas prices drop below $3 nationally?", 0.30, 12),
+            ("Will OpenAI release GPT-5 before April 2026?", 0.70, 8),
+            ("Will Polygon reach $2 by end of March?", 0.18, 9),
+            ("Will next jobs report beat expectations?", 0.52, 5),
+            ("Will there be a ceasefire agreement this month?", 0.25, 11),
         ]
-        return markets[:count]
+        
+        markets = []
+        for i, (question, yes_price, days) in enumerate(templates[:count]):
+            markets.append({
+                "id": f"market_mock_{i+1}",
+                "question": question,
+                "yes_price": yes_price,
+                "no_price": round(1 - yes_price, 2),
+                "volume_24h": random.randint(50000, 500000),
+                "liquidity": random.randint(30000, 200000),
+                "end_date": (now + timedelta(days=days)).isoformat(),
+                "active": True,
+            })
+        return markets

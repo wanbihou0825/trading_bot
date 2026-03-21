@@ -87,8 +87,8 @@ class WalletQualityConfig:
     min_profit_factor: Decimal = Decimal("1.2")
     # 最大回撤阈值
     max_drawdown_threshold: Decimal = Decimal("0.30")
-    # 最小质量评分 (用于自动发现)
-    min_quality_score: Decimal = Decimal("70")
+    # 最小质量评分 (用于自动发现, 0-10分制)
+    min_quality_score: Decimal = Decimal("7.0")
 
 
 @dataclass
@@ -102,6 +102,8 @@ class CopyTradingConfig:
     trade_db_path: str = "data/trades.db"
     # 最大跟单钱包数
     max_following_wallets: int = 10
+    # 扫描排名前N的钱包 (只分析官方排行榜前N名的钱包)
+    max_scan_wallets: int = 100
     # 跟单模式: full, proportional, fixed, smart
     mode: str = "smart"
     # 固定金额
@@ -207,6 +209,8 @@ class Settings:
             max_position_pct=Decimal(os.getenv("MAX_POSITION_PCT", "0.03")),
             max_concurrent_positions=int(os.getenv("MAX_CONCURRENT_POSITIONS", "5")),
             max_total_exposure=Decimal(os.getenv("MAX_TOTAL_EXPOSURE", "200")),
+            default_stop_loss_pct=Decimal(os.getenv("STOP_LOSS_PCT", "0.15")),
+            default_take_profit_pct=Decimal(os.getenv("TAKE_PROFIT_PCT", "0.25")),
         )
         
         # 加载Endgame配置
@@ -221,7 +225,7 @@ class Settings:
             min_trades=int(os.getenv("WALLET_MIN_TRADES", "20")),
             min_win_rate=Decimal(os.getenv("WALLET_MIN_WIN_RATE", "0.55")),
             min_profit_factor=Decimal(os.getenv("WALLET_MIN_PROFIT_FACTOR", "1.2")),
-            min_quality_score=Decimal(os.getenv("WALLET_MIN_QUALITY_SCORE", "70")),
+            min_quality_score=Decimal(os.getenv("WALLET_MIN_QUALITY_SCORE", "7.0")),
         )
         
         # 加载跟单配置
@@ -229,6 +233,7 @@ class Settings:
             enabled=os.getenv("COPY_TRADING_ENABLED", "true").lower() == "true",
             auto_discover=os.getenv("COPY_AUTO_DISCOVER", "true").lower() == "true",
             max_following_wallets=int(os.getenv("COPY_MAX_WALLETS", "10")),
+            max_scan_wallets=int(os.getenv("COPY_MAX_SCAN_WALLETS", "100")),
             mode=os.getenv("COPY_TRADING_MODE", "smart"),
             fixed_amount=Decimal(os.getenv("COPY_FIXED_AMOUNT", "10")),
             max_amount=Decimal(os.getenv("COPY_MAX_AMOUNT", "50")),

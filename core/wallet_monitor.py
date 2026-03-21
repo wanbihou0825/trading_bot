@@ -2,7 +2,7 @@
 钱包监控器
 ==========
 实时监控目标钱包的交易活动。
-支持轮询和WebSocket两种模式。
+通过 Polymarket Data API (/trades?user=) 轮询模式监控。
 """
 
 import asyncio
@@ -33,13 +33,14 @@ class WalletTransaction:
     """钱包交易记录"""
     tx_hash: str
     wallet_address: str
-    market_id: str
-    market_question: str
-    side: str  # "YES" or "NO"
+    market_id: str          # conditionId
+    market_question: str    # 市场标题
+    side: str               # "YES" or "NO" (outcome方向)
     size: Decimal
-    price: Decimal
+    price: Decimal          # 成交价格
     timestamp: datetime
-    tx_type: str  # "buy", "sell"
+    tx_type: str            # "buy"(开仓), "sell"(平仓)
+    token_id: str = ""      # asset token_id (下单时需要)
     pnl: Optional[Decimal] = None
     
     def to_dict(self) -> Dict[str, Any]:
@@ -53,6 +54,7 @@ class WalletTransaction:
             "price": str(self.price),
             "timestamp": self.timestamp.isoformat(),
             "tx_type": self.tx_type,
+            "token_id": self.token_id,
             "pnl": str(self.pnl) if self.pnl else None,
         }
 
@@ -77,16 +79,17 @@ class WalletMonitor:
     
     功能:
     1. 监控多个目标钱包的交易活动
-    2. 支持轮询和WebSocket两种模式
+    2. 通过 Data API 轮询检测新交易
     3. 自动发现和过滤交易
     4. 触发跟单回调
     """
     
-    POLYGONSCAN_API = "https://api.polygonscan.com/api"
+    # Polymarket Data API (公开，无需认证)
+    DATA_API = "https://data-api.polymarket.com"
     
     def __init__(
         self,
-        polygonscan_api_key: str,
+        polygonscan_api_key: str = "",
         mode: MonitorMode = MonitorMode.HYBRID,
         poll_interval: int = 30,
         ws_url: str = "",  # 留空，默认禁用WebSocket，使用轮询模式
@@ -419,83 +422,110 @@ class WalletMonitor:
         address: str,
         limit: int = 10
     ) -> List[WalletTransaction]:
-        """获取钱包交易记录"""
+        """通过 Polymarket Data API 获取钱包最近交易
+        
+        端点: GET /trades?user={address}&limit={limit}
+        返回字段: proxyWallet, side(BUY/SELL), outcome(Yes/No), 
+                  size, price, conditionId, title, transactionHash, 
+                  asset(token_id), timestamp 等
+        """
         if not self._session:
             return []
         
         try:
-            # 调用Polygonscan API
-            params = {
-                "module": "account",
-                "action": "tokentx",
-                "address": address,
-                "contractaddress": "0x...",  # Polymarket合约地址
-                "page": 1,
-                "offset": limit,
-                "sort": "desc",
-                "apikey": self.api_key,
-            }
-            
             async with self._session.get(
-                self.POLYGONSCAN_API,
-                params=params
+                f"{self.DATA_API}/trades",
+                params={
+                    "user": address.lower(),
+                    "limit": limit,
+                },
+                timeout=aiohttp.ClientTimeout(total=15)
             ) as response:
                 if response.status != 200:
-                    logger.warning(f"API请求失败: {response.status}")
+                    logger.warning(f"Data API /trades 返回 HTTP {response.status} (钱包: {address[:10]}...)")
                     return []
                 
                 data = await response.json()
                 
-                if data.get("status") != "1":
+                if not isinstance(data, list):
                     return []
                 
                 # 解析交易
                 transactions = []
-                for item in data.get("result", []):
-                    tx = self._parse_transaction(address, item)
+                for item in data:
+                    tx = self._parse_trade(address, item)
                     if tx:
                         transactions.append(tx)
                 
                 return transactions
                 
         except Exception as e:
-            logger.error(f"获取交易记录异常: {e}")
+            logger.error(f"获取钱包交易记录异常: {e}")
             return []
     
-    def _parse_transaction(
+    def _parse_trade(
         self,
         address: str,
         item: Dict[str, Any]
     ) -> Optional[WalletTransaction]:
-        """解析交易数据"""
+        """解析 Data API 交易数据
+        
+        字段映射:
+        - side (BUY/SELL) → tx_type (buy/sell): 买入=开仓, 卖出=平仓
+        - outcome (Yes/No) → side (YES/NO): 结果方向
+        - conditionId → market_id: 市场唯一标识
+        - title → market_question: 市场问题
+        - asset → token_id: 代币ID (下单时需要)
+        - transactionHash → tx_hash
+        """
         try:
-            # 从 tokenName/tokenSymbol 推断 side
-            token_name = (item.get("tokenName", "") or item.get("tokenSymbol", "")).lower()
-            if "yes" in token_name:
-                side = "YES"
-            elif "no" in token_name:
-                side = "NO"
+            tx_hash = item.get("transactionHash", "")
+            if not tx_hash:
+                return None
+            
+            # side: BUY=买入(开仓), SELL=卖出(平仓)
+            api_side = str(item.get("side", "")).upper()
+            tx_type = "buy" if api_side == "BUY" else "sell"
+            
+            # outcome: Yes/No → YES/NO
+            outcome = str(item.get("outcome", "Yes"))
+            side = outcome.upper() if outcome.upper() in ("YES", "NO") else "YES"
+            
+            # 价格和数量
+            price = Decimal(str(item.get("price", "0") or "0"))
+            size = Decimal(str(item.get("size", "0") or "0"))
+            
+            if size <= 0:
+                return None
+            
+            # 时间戳
+            ts = item.get("timestamp", 0)
+            if isinstance(ts, (int, float)):
+                if ts > 1e12:
+                    ts = ts / 1000
+                timestamp = datetime.fromtimestamp(ts, tz=timezone.utc)
             else:
-                side = "YES"
-                logger.warning(f"无法从 token 信息推断 side，默认 YES | token: {token_name}")
-
-            # 使用 tokenDecimal 做精度转换
-            decimals = int(item.get("tokenDecimal", "6"))
-            raw_value = Decimal(item.get("value", "0"))
-            size = raw_value / Decimal(10 ** decimals)
-
+                timestamp = datetime.now(timezone.utc)
+            
+            # 市场信息
+            condition_id = item.get("conditionId", "")
+            title = item.get("title", "")
+            token_id = item.get("asset", "")
+            
             tx = WalletTransaction(
-                tx_hash=item.get("hash", ""),
-                wallet_address=address,
-                market_id=item.get("tokenID", ""),
-                market_question=item.get("tokenSymbol", ""),
+                tx_hash=tx_hash,
+                wallet_address=address.lower(),
+                market_id=condition_id,
+                market_question=title,
                 side=side,
                 size=size,
-                price=Decimal("0"),  # 链上无价格信息，下游使用实时市场价格
-                timestamp=datetime.fromtimestamp(int(item.get("timeStamp", 0))),
-                tx_type="buy" if item.get("to", "").lower() == address.lower() else "sell",
+                price=price,
+                timestamp=timestamp,
+                tx_type=tx_type,
+                token_id=token_id,
             )
             return tx
+            
         except Exception as e:
             logger.error(f"解析交易异常: {e}")
             return None
