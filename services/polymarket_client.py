@@ -559,7 +559,8 @@ class PolymarketClient:
             session = self._check_session()
             async with session.get(
                 f"{PolymarketAPI.CLOB_API}/price",
-                params=params
+                params=params,
+                timeout=aiohttp.ClientTimeout(total=10)
             ) as response:
                 if response.status == 200:
                     data = await response.json()
@@ -592,7 +593,8 @@ class PolymarketClient:
         session = self._check_session()
         async with session.get(
             f"{PolymarketAPI.CLOB_API}/book",
-            params={"token_id": token_id}
+            params={"token_id": token_id},
+            timeout=aiohttp.ClientTimeout(total=10)
         ) as response:
             if response.status == 200:
                 return await response.json()

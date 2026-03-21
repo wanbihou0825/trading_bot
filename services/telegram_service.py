@@ -50,6 +50,7 @@ class TelegramService:
         self.bot_token = bot_token
         self.chat_id = chat_id
         self.enabled = enabled and bool(bot_token) and bool(chat_id)
+        self._session = None  # lazy-init aiohttp.ClientSession
         
         if self.enabled:
             logger.info(f"Telegram 服务已启用 | Chat ID: {chat_id}")
@@ -79,26 +80,36 @@ class TelegramService:
                 method="sendMessage"
             )
             
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    url,
-                    json={
-                        "chat_id": self.chat_id,
-                        "text": text,
-                        "parse_mode": parse_mode
-                    }
-                ) as response:
-                    if response.status == 200:
-                        logger.debug("Telegram 消息发送成功")
-                        return True
-                    else:
-                        error = await response.text()
-                        logger.warning(f"Telegram 发送失败: {error}")
-                        return False
+            if self._session is None or self._session.closed:
+                self._session = aiohttp.ClientSession(
+                    timeout=aiohttp.ClientTimeout(total=10)
+                )
+            
+            async with self._session.post(
+                url,
+                json={
+                    "chat_id": self.chat_id,
+                    "text": text,
+                    "parse_mode": parse_mode
+                }
+            ) as response:
+                if response.status == 200:
+                    logger.debug("Telegram 消息发送成功")
+                    return True
+                else:
+                    error = await response.text()
+                    logger.warning(f"Telegram 发送失败: {error}")
+                    return False
                         
         except Exception as e:
             logger.error(f"Telegram 发送异常: {e}")
             return False
+    
+    async def close(self) -> None:
+        """关闭持久化 session"""
+        if self._session and not self._session.closed:
+            await self._session.close()
+            self._session = None
     
     async def send_startup_notification(
         self,
@@ -137,9 +148,14 @@ class TelegramService:
         amount: Decimal,
         price: Decimal,
         confidence: Decimal,
-        strategy: str
+        strategy: str,
+        source_wallet: str = "",
     ) -> None:
         """发送交易通知"""
+        wallet_line = ""
+        if source_wallet:
+            short = f"{source_wallet[:6]}...{source_wallet[-4:]}"
+            wallet_line = f"\n<b>源钱包:</b> <code>{source_wallet}</code> (<a href='https://polygonscan.com/address/{source_wallet}'>{short}</a>)"
         message = f"""
 <b>交易执行</b>
 
@@ -149,7 +165,7 @@ class TelegramService:
 <b>数量:</b> ${amount:.2f}
 <b>价格:</b> {price:.4f}
 <b>置信度:</b> {confidence*100:.1f}%
-<b>策略:</b> {strategy}
+<b>策略:</b> {strategy}{wallet_line}
 """
         await self.send_message(message)
     

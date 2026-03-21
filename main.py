@@ -342,9 +342,17 @@ class TradingBot:
                 logger.error(f"配置错误: {error}")
             raise InitializationError(f"配置验证失败: {errors}")
         
-        # 连接 Polymarket
-        if not await self.client.connect():
-            raise InitializationError("无法连接到 Polymarket API")
+        # 连接 Polymarket (带重试)
+        max_connect_retries = 3
+        for attempt in range(1, max_connect_retries + 1):
+            if await self.client.connect():
+                break
+            if attempt < max_connect_retries:
+                delay = 5 * (2 ** (attempt - 1))  # 5s, 10s, 20s
+                logger.warning(f"连接 Polymarket 失败，{delay}s 后重试 ({attempt}/{max_connect_retries})")
+                await asyncio.sleep(delay)
+            else:
+                raise InitializationError(f"连接 Polymarket API 失败，已重试 {max_connect_retries} 次")
         
         # 连接持久化数据库
         await self.persistence.connect()
@@ -389,12 +397,15 @@ class TradingBot:
         self.monitoring.register_component("risk_manager", self._check_risk_manager_health)
         await self.monitoring.start()
         
-        # 发送启动通知
-        await self.telegram.send_startup_notification(
-            wallet_address=self.settings.wallet_address,
-            dry_run=self.settings.dry_run,
-            max_daily_loss=self.settings.risk.max_daily_loss
-        )
+        # 发送启动通知 (Telegram不可用不阻塞启动)
+        try:
+            await self.telegram.send_startup_notification(
+                wallet_address=self.settings.wallet_address,
+                dry_run=self.settings.dry_run,
+                max_daily_loss=self.settings.risk.max_daily_loss
+            )
+        except Exception as e:
+            logger.warning(f"发送启动通知失败 (不影响运行): {e}")
         
         self._running = True
         logger.info("交易机器人已启动")
@@ -517,6 +528,12 @@ class TradingBot:
             await self.telegram.send_shutdown_notification("用户请求停止")
         except Exception as e:
             logger.error(f"发送停止通知异常: {e}")
+        
+        # 关闭 Telegram session
+        try:
+            await self.telegram.close()
+        except Exception as e:
+            logger.error(f"关闭 Telegram session 异常: {e}")
         
         # 记录审计日志
         if self.audit_logger:

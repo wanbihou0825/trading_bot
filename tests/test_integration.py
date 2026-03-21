@@ -12,7 +12,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from core.risk_manager import RiskManager
 from core.circuit_breaker import CircuitBreaker
 from core.copy_executor import CopyExecutor, CopyConfig, CopyMode
-from services.polymarket_client import PolymarketClient
+from services.polymarket_client import PolymarketClient, OrderResult
 from strategies.adaptive import AdaptiveStrategyManager
 from strategies.base import MarketData, SignalType
 
@@ -21,7 +21,7 @@ class TestTradingFlow:
     """完整交易流程测试"""
     
     @pytest.fixture
-    def trading_system(self, mock_settings):
+    def trading_system(self, mock_polymarket_client):
         """创建完整交易系统"""
         # 熔断器
         circuit_breaker = CircuitBreaker(
@@ -42,14 +42,11 @@ class TestTradingFlow:
         # 策略管理器
         strategy_manager = AdaptiveStrategyManager(min_confidence=Decimal("0.7"))
         
-        # 客户端
-        client = PolymarketClient(dry_run=True)
-        
         return {
             "circuit_breaker": circuit_breaker,
             "risk_manager": risk_manager,
             "strategy_manager": strategy_manager,
-            "client": client
+            "client": mock_polymarket_client
         }
     
     @pytest.mark.asyncio
@@ -59,17 +56,15 @@ class TestTradingFlow:
         sm = trading_system["strategy_manager"]
         client = trading_system["client"]
         
-        await client.connect()
-        
         # 1. 创建市场数据
         market_data = MarketData(
             market_id="market_endgame_1",
             question="Will Fed announce rate decision by March 22, 2026?",
-            yes_price=Decimal("0.96"),
-            no_price=Decimal("0.04"),
+            yes_price=Decimal("0.99"),
+            no_price=Decimal("0.01"),
             volume_24h=Decimal("250000"),
             liquidity=Decimal("150000"),
-            days_to_resolution=3
+            days_to_resolution=1
         )
         
         # 2. 策略分析
@@ -103,7 +98,7 @@ class TestTradingFlow:
         assert order.success is True
         
         # 5. 记录持仓
-        position = rm.open_position(
+        position = await rm.open_position(
             market_id=market_data.market_id,
             market_question=market_data.question,
             side=side,
@@ -120,10 +115,8 @@ class TestTradingFlow:
         rm = trading_system["risk_manager"]
         client = trading_system["client"]
         
-        await client.connect()
-        
         # 1. 开仓
-        rm.open_position(
+        await rm.open_position(
             market_id="market_1",
             market_question="Test?",
             side="YES",
@@ -140,7 +133,7 @@ class TestTradingFlow:
         
         # 3. 执行平仓
         for exit_info in exits:
-            position = rm.close_position(
+            position = await rm.close_position(
                 market_id=exit_info["market_id"],
                 exit_price=exit_info["exit_price"]
             )
@@ -164,7 +157,7 @@ class TestTradingFlow:
         can_trade, reason = cb.check_can_trade()
         
         assert can_trade is False
-        assert "连续亏损" in reason or "每日亏损" in reason
+        assert "日累计损失" in reason or "连续亏损" in reason
         
         # 验证风险检查阻止交易
         risk_result = rm.check_trade(
@@ -185,7 +178,7 @@ class TestTradingFlow:
         
         # 测试最大仓位限制
         for i in range(5):
-            rm.open_position(
+            await rm.open_position(
                 market_id=f"market_{i}",
                 market_question=f"Test {i}",
                 side="YES",
@@ -218,28 +211,39 @@ class TestCopyTradingFlow:
         sample_wallet_transaction
     ):
         """测试完整跟单流程"""
-        from core.wallet_quality_scorer import QualityScore, WalletTier, WalletStats
-        from core.market_maker_detector import MarketMakerScore
+        from core.wallet_quality_scorer import QualityScore, WalletTier, TradingStats
+        from core.market_maker_detector import MarketMakerScore, MarketMakerType
         
         # 设置mock返回值
         quality_scorer = MagicMock()
         quality_scorer.score_wallet.return_value = QualityScore(
-            overall_score=Decimal("8.5"),
+            wallet_address="0xabcdef1234567890abcdef1234567890abcdef12",
             tier=WalletTier.EXPERT,
-            should_follow=True,
-            stats=WalletStats(
+            overall_score=Decimal("8.5"),
+            win_rate_score=Decimal("8.5"),
+            profit_factor_score=Decimal("8.5"),
+            consistency_score=Decimal("8.5"),
+            risk_score=Decimal("8.5"),
+            specialty_score=Decimal("8.5"),
+            stats=TradingStats(
                 total_trades=100,
-                win_rate=Decimal("0.68"),
-                profit_factor=Decimal("2.1"),
-                avg_pnl=Decimal("75"),
-                sharpe_ratio=Decimal("1.8")
+                winning_trades=68,
+                losing_trades=32,
+                total_profit=Decimal("150"),
+                total_loss=Decimal("71"),
+                max_drawdown=Decimal("10")
             )
         )
         
         market_maker_detector = MagicMock()
         market_maker_detector.detect.return_value = MarketMakerScore(
+            wallet_address="0xabcdef1234567890abcdef1234567890abcdef12",
             is_market_maker=False,
-            confidence=Decimal("0.1")
+            maker_type=MarketMakerType.UNKNOWN,
+            confidence=Decimal("0.1"),
+            patterns=[],
+            stats={},
+            recommendation="neutral"
         )
         
         warning_detector = MagicMock()

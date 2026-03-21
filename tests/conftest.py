@@ -82,7 +82,14 @@ def mock_polymarket_client():
         filled_size=Decimal("10"),
         filled_price=Decimal("0.5")
     ))
+    client.place_market_order = AsyncMock(return_value=OrderResult(
+        success=True,
+        order_id="test_order_123",
+        filled_size=Decimal("10"),
+        filled_price=Decimal("0.5")
+    ))
     client.get_account_balance = AsyncMock(return_value=Decimal("1000"))
+    client.get_user_trades = AsyncMock(return_value=[])
     return client
 
 
@@ -129,5 +136,6 @@ def sample_wallet_transaction():
         side="YES",
         size=Decimal("100"),
         price=Decimal("0.65"),
-        timestamp=datetime.now(timezone.utc)
+        timestamp=datetime.now(timezone.utc),
+        tx_type="buy"
     )

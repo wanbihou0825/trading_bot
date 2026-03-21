@@ -469,15 +469,29 @@ class WalletMonitor:
     ) -> Optional[WalletTransaction]:
         """解析交易数据"""
         try:
-            # 简化解析，实际需要根据Polymarket合约事件解析
+            # 从 tokenName/tokenSymbol 推断 side
+            token_name = (item.get("tokenName", "") or item.get("tokenSymbol", "")).lower()
+            if "yes" in token_name:
+                side = "YES"
+            elif "no" in token_name:
+                side = "NO"
+            else:
+                side = "YES"
+                logger.warning(f"无法从 token 信息推断 side，默认 YES | token: {token_name}")
+
+            # 使用 tokenDecimal 做精度转换
+            decimals = int(item.get("tokenDecimal", "6"))
+            raw_value = Decimal(item.get("value", "0"))
+            size = raw_value / Decimal(10 ** decimals)
+
             tx = WalletTransaction(
                 tx_hash=item.get("hash", ""),
                 wallet_address=address,
                 market_id=item.get("tokenID", ""),
                 market_question=item.get("tokenSymbol", ""),
-                side="YES",  # 需要从事件数据解析
-                size=Decimal(item.get("value", "0")) / Decimal("10**6"),
-                price=Decimal("0.5"),  # 需要从事件数据解析
+                side=side,
+                size=size,
+                price=Decimal("0"),  # 链上无价格信息，下游使用实时市场价格
                 timestamp=datetime.fromtimestamp(int(item.get("timeStamp", 0))),
                 tx_type="buy" if item.get("to", "").lower() == address.lower() else "sell",
             )

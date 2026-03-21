@@ -9,12 +9,12 @@ from decimal import Decimal
 from unittest.mock import AsyncMock, MagicMock, patch
 from datetime import datetime, timezone
 
-from core.copy_executor import CopyExecutor, CopyConfig, CopyMode, CopyTrade
+from core.copy_executor import CopyExecutor, CopyConfig, CopyMode, CopyTrade, CopyAction
 from core.risk_manager import RiskManager
 from core.circuit_breaker import CircuitBreaker
-from core.wallet_quality_scorer import WalletQualityScorer, QualityScore, WalletTier, WalletStats
-from core.market_maker_detector import MarketMakerDetector, MarketMakerScore
-from core.red_flag_detector import RedFlagDetector
+from core.wallet_quality_scorer import WalletQualityScorer, QualityScore, WalletTier, TradingStats
+from core.market_maker_detector import MarketMakerDetector, MarketMakerScore, MarketMakerType
+from core.red_flag_detector import RedFlagDetector, RedFlag, RedFlagType
 from services.polymarket_client import PolymarketClient, OrderResult
 from core.wallet_monitor import WalletTransaction
 
@@ -27,22 +27,33 @@ class TestCopyExecutor:
         """创建跟单执行器实例"""
         quality_scorer = MagicMock(spec=WalletQualityScorer)
         quality_scorer.score_wallet.return_value = QualityScore(
-            overall_score=Decimal("8.0"),
+            wallet_address="0xabcdef1234567890abcdef1234567890abcdef12",
             tier=WalletTier.EXPERT,
-            should_follow=True,
-            stats=WalletStats(
+            overall_score=Decimal("8.0"),
+            win_rate_score=Decimal("8.0"),
+            profit_factor_score=Decimal("8.0"),
+            consistency_score=Decimal("8.0"),
+            risk_score=Decimal("8.0"),
+            specialty_score=Decimal("8.0"),
+            stats=TradingStats(
                 total_trades=100,
-                win_rate=Decimal("0.65"),
-                profit_factor=Decimal("1.8"),
-                avg_pnl=Decimal("50"),
-                sharpe_ratio=Decimal("1.5")
+                winning_trades=65,
+                losing_trades=35,
+                total_profit=Decimal("130"),
+                total_loss=Decimal("72"),
+                max_drawdown=Decimal("10")
             )
         )
         
         market_maker_detector = MagicMock(spec=MarketMakerDetector)
         market_maker_detector.detect.return_value = MarketMakerScore(
+            wallet_address="0xabcdef1234567890abcdef1234567890abcdef12",
             is_market_maker=False,
-            confidence=Decimal("0.2")
+            maker_type=MarketMakerType.UNKNOWN,
+            confidence=Decimal("0.2"),
+            patterns=[],
+            stats={},
+            recommendation="neutral"
         )
         
         warning_detector = MagicMock(spec=RedFlagDetector)
@@ -92,15 +103,21 @@ class TestCopyExecutor:
         """测试低质量钱包跳过"""
         # 修改返回低质量评分
         copy_executor.quality_scorer.score_wallet.return_value = QualityScore(
-            overall_score=Decimal("3.0"),
+            wallet_address="0xabcdef1234567890abcdef1234567890abcdef12",
             tier=WalletTier.POOR,
-            should_follow=False,
-            stats=WalletStats(
+            overall_score=Decimal("3.0"),
+            win_rate_score=Decimal("3.0"),
+            profit_factor_score=Decimal("2.0"),
+            consistency_score=Decimal("2.0"),
+            risk_score=Decimal("3.0"),
+            specialty_score=Decimal("2.0"),
+            stats=TradingStats(
                 total_trades=10,
-                win_rate=Decimal("0.35"),
-                profit_factor=Decimal("0.5"),
-                avg_pnl=Decimal("-20"),
-                sharpe_ratio=Decimal("-0.5")
+                winning_trades=4,
+                losing_trades=6,
+                total_profit=Decimal("20"),
+                total_loss=Decimal("40"),
+                max_drawdown=Decimal("30")
             )
         )
         
@@ -112,7 +129,7 @@ class TestCopyExecutor:
     async def test_process_transaction_risk_blocked(self, copy_executor, sample_wallet_transaction):
         """测试风险检查阻止"""
         # 触发熔断器
-        copy_executor.risk_manager.circuit_breaker.trigger("测试触发")
+        copy_executor.risk_manager.circuit_breaker._trigger("测试触发")
         
         result = await copy_executor.process_transaction(sample_wallet_transaction)
         
@@ -121,10 +138,8 @@ class TestCopyExecutor:
     @pytest.mark.asyncio
     async def test_process_transaction_warning_blocked(self, copy_executor, sample_wallet_transaction):
         """测试警告检测阻止"""
-        from core.red_flag_detector import RedFlag
-        
         copy_executor.warning_detector.detect.return_value = [
-            RedFlag(type="suspicious_pattern", severity="high", description="可疑模式")
+            RedFlag(flag_type=RedFlagType.SUSPICIOUS_TIMING, severity="high", description="可疑模式")
         ]
         copy_executor.warning_detector.should_block_trading.return_value = (True, "检测到可疑活动")
         
@@ -153,13 +168,19 @@ class TestCopyExecutor:
             side="YES",
             size=Decimal("1000"),  # 源交易金额大
             price=Decimal("0.5"),
-            timestamp=datetime.now(timezone.utc)
+            timestamp=datetime.now(timezone.utc),
+            tx_type="buy"
         )
         
         score = QualityScore(
-            overall_score=Decimal("8"),
+            wallet_address="0x1234",
             tier=WalletTier.EXPERT,
-            should_follow=True,
+            overall_score=Decimal("8"),
+            win_rate_score=Decimal("8"),
+            profit_factor_score=Decimal("8"),
+            consistency_score=Decimal("8"),
+            risk_score=Decimal("8"),
+            specialty_score=Decimal("8"),
             stats=MagicMock()
         )
         
@@ -192,13 +213,19 @@ class TestCopyExecutor:
             side="YES",
             size=Decimal("200"),
             price=Decimal("0.5"),
-            timestamp=datetime.now(timezone.utc)
+            timestamp=datetime.now(timezone.utc),
+            tx_type="buy"
         )
         
         score = QualityScore(
-            overall_score=Decimal("8"),
+            wallet_address="0x1234",
             tier=WalletTier.EXPERT,
-            should_follow=True,
+            overall_score=Decimal("8"),
+            win_rate_score=Decimal("8"),
+            profit_factor_score=Decimal("8"),
+            consistency_score=Decimal("8"),
+            risk_score=Decimal("8"),
+            specialty_score=Decimal("8"),
             stats=MagicMock()
         )
         
@@ -210,9 +237,14 @@ class TestCopyExecutor:
         """测试智能模式"""
         # Expert级别，乘数1.5
         score = QualityScore(
-            overall_score=Decimal("8.0"),  # 置信度0.8
+            wallet_address="0xabcdef1234567890abcdef1234567890abcdef12",
             tier=WalletTier.EXPERT,
-            should_follow=True,
+            overall_score=Decimal("8.0"),  # 置信度0.8
+            win_rate_score=Decimal("8.0"),
+            profit_factor_score=Decimal("8.0"),
+            consistency_score=Decimal("8.0"),
+            risk_score=Decimal("8.0"),
+            specialty_score=Decimal("8.0"),
             stats=MagicMock()
         )
         
@@ -247,13 +279,19 @@ class TestCopyExecutor:
             side="YES",
             size=Decimal("100"),
             price=Decimal("0.5"),
-            timestamp=datetime.now(timezone.utc)
+            timestamp=datetime.now(timezone.utc),
+            tx_type="buy"
         )
         
         score = QualityScore(
-            overall_score=Decimal("9.5"),  # 高置信度
+            wallet_address="0x1234",
             tier=WalletTier.ELITE,
-            should_follow=True,
+            overall_score=Decimal("9.5"),  # 高置信度
+            win_rate_score=Decimal("9.5"),
+            profit_factor_score=Decimal("9.5"),
+            consistency_score=Decimal("9.5"),
+            risk_score=Decimal("9.5"),
+            specialty_score=Decimal("9.5"),
             stats=MagicMock()
         )
         
@@ -272,6 +310,7 @@ class TestCopyExecutor:
                 market_id="m1",
                 market_question="Test 1",
                 side="YES",
+                action=CopyAction.OPEN,
                 original_size=Decimal("100"),
                 copy_size=Decimal("10"),
                 copy_price=Decimal("0.5"),
@@ -283,6 +322,7 @@ class TestCopyExecutor:
                 market_id="m2",
                 market_question="Test 2",
                 side="NO",
+                action=CopyAction.CLOSE,
                 original_size=Decimal("100"),
                 copy_size=Decimal("10"),
                 copy_price=Decimal("0.5"),
@@ -323,6 +363,7 @@ class TestCopyTrade:
             market_id="market_1",
             market_question="Test question?",
             side="YES",
+            action=CopyAction.OPEN,
             original_size=Decimal("100"),
             copy_size=Decimal("10"),
             copy_price=Decimal("0.65")

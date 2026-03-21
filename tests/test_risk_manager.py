@@ -5,6 +5,7 @@
 """
 
 import pytest
+import asyncio
 from decimal import Decimal
 from datetime import datetime, timezone
 
@@ -51,12 +52,14 @@ class TestRiskManager:
         """测试交易检查 - 超过最大仓位数"""
         # 开满仓位
         for i in range(5):
-            mock_risk_manager.open_position(
-                market_id=f"market_{i}",
-                market_question=f"Test {i}",
-                side="YES",
-                price=Decimal("0.5"),
-                size=Decimal("10")
+            asyncio.get_event_loop().run_until_complete(
+                mock_risk_manager.open_position(
+                    market_id=f"market_{i}",
+                    market_question=f"Test {i}",
+                    side="YES",
+                    price=Decimal("0.5"),
+                    size=Decimal("10")
+                )
             )
         
         # 尝试再开仓
@@ -74,12 +77,14 @@ class TestRiskManager:
     def test_check_trade_total_exposure(self, mock_risk_manager):
         """测试交易检查 - 超过总敞口限制"""
         # 开一个大仓位
-        mock_risk_manager.open_position(
-            market_id="market_1",
-            market_question="Test",
-            side="YES",
-            price=Decimal("0.5"),
-            size=Decimal("180")  # 180 * 0.5 = 90 敞口
+        asyncio.get_event_loop().run_until_complete(
+            mock_risk_manager.open_position(
+                market_id="market_1",
+                market_question="Test",
+                side="YES",
+                price=Decimal("0.5"),
+                size=Decimal("180")  # 180 * 0.5 = 90 敞口
+            )
         )
         
         # 尝试再开大仓位
@@ -97,7 +102,7 @@ class TestRiskManager:
     def test_check_trade_circuit_breaker(self, mock_risk_manager, mock_circuit_breaker):
         """测试交易检查 - 熔断器触发"""
         # 触发熔断器
-        mock_circuit_breaker.trigger("测试触发")
+        mock_circuit_breaker._trigger("测试触发")
         
         result = mock_risk_manager.check_trade(
             market_id="market_1",
@@ -112,12 +117,14 @@ class TestRiskManager:
     
     def test_open_position(self, mock_risk_manager):
         """测试开仓"""
-        position = mock_risk_manager.open_position(
-            market_id="market_1",
-            market_question="Test question?",
-            side="YES",
-            price=Decimal("0.65"),
-            size=Decimal("20")
+        position = asyncio.get_event_loop().run_until_complete(
+            mock_risk_manager.open_position(
+                market_id="market_1",
+                market_question="Test question?",
+                side="YES",
+                price=Decimal("0.65"),
+                size=Decimal("20")
+            )
         )
         
         assert position.market_id == "market_1"
@@ -133,19 +140,24 @@ class TestRiskManager:
     
     def test_close_position(self, mock_risk_manager):
         """测试平仓"""
+        loop = asyncio.get_event_loop()
         # 先开仓
-        mock_risk_manager.open_position(
-            market_id="market_1",
-            market_question="Test question?",
-            side="YES",
-            price=Decimal("0.50"),
-            size=Decimal("100")
+        loop.run_until_complete(
+            mock_risk_manager.open_position(
+                market_id="market_1",
+                market_question="Test question?",
+                side="YES",
+                price=Decimal("0.50"),
+                size=Decimal("100")
+            )
         )
         
         # 平仓 (价格上涨到0.70)
-        position = mock_risk_manager.close_position(
-            market_id="market_1",
-            exit_price=Decimal("0.70")
+        position = loop.run_until_complete(
+            mock_risk_manager.close_position(
+                market_id="market_1",
+                exit_price=Decimal("0.70")
+            )
         )
         
         assert position is not None
@@ -179,13 +191,15 @@ class TestRiskManager:
     def test_check_position_exits_stop_loss(self, mock_risk_manager):
         """测试止损触发"""
         # 开YES仓位，入场0.60
-        mock_risk_manager.open_position(
-            market_id="market_1",
-            market_question="Test?",
-            side="YES",
-            price=Decimal("0.60"),
-            size=Decimal("10"),
-            stop_loss_pct=Decimal("0.10")
+        asyncio.get_event_loop().run_until_complete(
+            mock_risk_manager.open_position(
+                market_id="market_1",
+                market_question="Test?",
+                side="YES",
+                price=Decimal("0.60"),
+                size=Decimal("10"),
+                stop_loss_pct=Decimal("0.10")
+            )
         )
         
         # 价格下跌到0.50（触发止损）
@@ -199,13 +213,15 @@ class TestRiskManager:
     def test_check_position_exits_take_profit(self, mock_risk_manager):
         """测试止盈触发"""
         # 开YES仓位，入场0.50
-        mock_risk_manager.open_position(
-            market_id="market_1",
-            market_question="Test?",
-            side="YES",
-            price=Decimal("0.50"),
-            size=Decimal("10"),
-            take_profit_pct=Decimal("0.30")
+        asyncio.get_event_loop().run_until_complete(
+            mock_risk_manager.open_position(
+                market_id="market_1",
+                market_question="Test?",
+                side="YES",
+                price=Decimal("0.50"),
+                size=Decimal("10"),
+                take_profit_pct=Decimal("0.30")
+            )
         )
         
         # 价格上涨到0.70（触发止盈）
@@ -218,20 +234,25 @@ class TestRiskManager:
     
     def test_get_total_exposure(self, mock_risk_manager):
         """测试总敞口计算"""
+        loop = asyncio.get_event_loop()
         # 开两个仓位
-        mock_risk_manager.open_position(
-            market_id="m1",
-            market_question="Test 1",
-            side="YES",
-            price=Decimal("0.50"),
-            size=Decimal("100")  # 敞口 50
+        loop.run_until_complete(
+            mock_risk_manager.open_position(
+                market_id="m1",
+                market_question="Test 1",
+                side="YES",
+                price=Decimal("0.50"),
+                size=Decimal("100")  # 敞口 50
+            )
         )
-        mock_risk_manager.open_position(
-            market_id="m2",
-            market_question="Test 2",
-            side="NO",
-            price=Decimal("0.50"),
-            size=Decimal("100")  # 敞口 50
+        loop.run_until_complete(
+            mock_risk_manager.open_position(
+                market_id="m2",
+                market_question="Test 2",
+                side="NO",
+                price=Decimal("0.50"),
+                size=Decimal("100")  # 敞口 50
+            )
         )
         
         exposure = mock_risk_manager.get_total_exposure()
@@ -240,12 +261,14 @@ class TestRiskManager:
     def test_duplicate_position_blocked(self, mock_risk_manager):
         """测试禁止重复开仓同一市场"""
         # 开仓
-        mock_risk_manager.open_position(
-            market_id="market_1",
-            market_question="Test?",
-            side="YES",
-            price=Decimal("0.5"),
-            size=Decimal("10")
+        asyncio.get_event_loop().run_until_complete(
+            mock_risk_manager.open_position(
+                market_id="market_1",
+                market_question="Test?",
+                side="YES",
+                price=Decimal("0.5"),
+                size=Decimal("10")
+            )
         )
         
         # 尝试再次开仓同一市场

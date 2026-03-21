@@ -42,10 +42,11 @@
 - **强制清仓** — 一键关闭所有持仓
 - **L2 认证** — 通过 py-clob-client 自动派生 API 密钥 (EIP-712 签名)
 - **Gnosis Safe** — 支持浏览器钱包 Proxy 合约 (signature_type=2)
+- **连接重试** — Polymarket API 连接失败自动重试 3 次 (指数退避 5s/10s/20s)
 
 ### 监控
-- **Telegram 通知** — 交易提醒、异常告警、定期报告
-- **WebSocket 实时推送** — 市场数据和交易事件
+- **Telegram 通知** — 交易提醒 (含源钱包 Polygonscan 链接)、异常告警、定期报告
+- **WebSocket 实时推送** — 市场数据和交易事件 (可选, 留空自动回退轮询)
 - **结构化日志** — JSON 格式生产级日志
 
 ## 快速开始
@@ -121,7 +122,8 @@ python main.py
 | `COPY_DELAY_SECONDS` | `1.0` | 跟单延迟 (秒) |
 | `COPY_MAX_WALLETS` | `10` | 最大跟单钱包数 |
 | `COPY_FOLLOW_CLOSE` | `true` | 跟平仓 (关键!) |
-| `COPY_POSITION_SYNC_INTERVAL` | `60` | 持仓同步间隔 (秒) |
+| `COPY_CLOSE_ON_TARGET_CLOSE` | `true` | 目标平仓时自动跟随平仓 |
+| `COPY_POSITION_SYNC_INTERVAL` | `300` | 持仓同步间隔 (秒) |
 | `SEED_WALLETS` | | 种子钱包 (逗号分隔) |
 | `TARGET_WALLETS` | | 目标钱包 (逗号分隔) |
 
@@ -160,6 +162,25 @@ python main.py
 | `ENDGAME_MIN_PROB` | `0.95` | 最小入场概率 |
 | `ENDGAME_MAX_DAYS` | `7` | 最大距结算天数 |
 | `ENDGAME_MIN_LIQUIDITY` | `10000` | 最小日流动性 (USD) |
+
+### WebSocket 配置
+
+| 环境变量 | 默认值 | 说明 |
+|---------|--------|------|
+| `WEBSOCKET_ENABLED` | `true` | 启用 WebSocket 实时推送 |
+| `POLYMARKET_WS_URL` | `wss://ws-subscriptions-clob.polymarket.com/ws/market` | Polymarket WebSocket |
+| `WALLET_MONITOR_WS_URL` | _(空)_ | 钱包监控 WSS (Polygon RPC, 如 Alchemy WSS; 留空回退轮询) |
+| `WS_RECONNECT_INTERVAL` | `5` | 重连间隔 (秒) |
+| `WS_MAX_RECONNECT` | `10` | 最大重连次数 |
+
+### Telegram 通知
+
+| 环境变量 | 默认值 | 说明 |
+|---------|--------|------|
+| `TELEGRAM_BOT_TOKEN` | _(空)_ | Bot Token (通过 @BotFather 创建) |
+| `TELEGRAM_CHAT_ID` | _(空)_ | Chat ID (通过 @userinfobot 获取) |
+
+> 配置 Telegram 后，交易通知会包含源钱包的完整地址和 Polygonscan 链接，方便手动验证。
 
 ## 项目结构
 

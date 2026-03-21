@@ -337,7 +337,7 @@ class CopyExecutor:
                     )
                     
                     # 跟踪持仓
-                    self._track_position(
+                    await self._track_position(
                         wallet_address=tx.wallet_address,
                         market_id=tx.market_id,
                         side=tx.side,
@@ -372,7 +372,8 @@ class CopyExecutor:
                             amount=copy_trade.copy_size,
                             price=order_result.filled_price,
                             confidence=score.overall_score / Decimal("10"),
-                            strategy=f"copy_{score.tier.value}"
+                            strategy=f"copy_{score.tier.value}",
+                            source_wallet=tx.wallet_address,
                         )
                         except Exception as e:
                             logger.error(f"发送开仓通知失败: {e}")
@@ -630,7 +631,7 @@ class CopyExecutor:
     # 辅助方法
     # ═══════════════════════════════════════════════════════════════
     
-    def _track_position(
+    async def _track_position(
         self,
         wallet_address: str,
         market_id: str,
@@ -638,15 +639,16 @@ class CopyExecutor:
         source_size: Decimal,
         our_size: Decimal,
     ) -> None:
-        """跟踪持仓 (不需要异步锁，因为已在 _open_lock 内调用)"""
+        """跟踪持仓 (使用 _position_lock 保护，与 _sync_positions 共享同一把锁)"""
         key = f"{wallet_address.lower()}:{market_id}"
-        self._tracked_positions[key] = TrackedPosition(
-            source_wallet=wallet_address,
-            market_id=market_id,
-            side=side,
-            source_size=source_size,
-            our_size=our_size,
-        )
+        async with self._position_lock:
+            self._tracked_positions[key] = TrackedPosition(
+                source_wallet=wallet_address,
+                market_id=market_id,
+                side=side,
+                source_size=source_size,
+                our_size=our_size,
+            )
     
     async def _get_wallet_score(self, wallet_address: str) -> QualityScore:
         """获取钱包评分 (带1小时TTL缓存)"""

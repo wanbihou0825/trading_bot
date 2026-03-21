@@ -189,11 +189,11 @@ def calculate_stop_loss_price(
     entry = to_decimal(entry_price)
     pct = to_decimal(stop_loss_pct)
     
-    if side.upper() == "BUY":
-        # 买入止损：价格下跌
+    if side.upper() in ("BUY", "YES"):
+        # 买入/YES止损：价格下跌
         stop_price = entry * (Decimal("1") - pct)
     else:
-        # 卖出止损：价格上涨
+        # 卖出/NO止损：价格上涨
         stop_price = entry * (Decimal("1") + pct)
     
     return stop_price.quantize(Decimal("0.0001"), rounding=ROUNDING_MODE)
@@ -218,11 +218,11 @@ def calculate_take_profit_price(
     entry = to_decimal(entry_price)
     pct = to_decimal(take_profit_pct)
     
-    if side.upper() == "BUY":
-        # 买入止盈：价格上涨
+    if side.upper() in ("BUY", "YES"):
+        # 买入/YES止盈：价格上涨
         profit_price = entry * (Decimal("1") + pct)
     else:
-        # 卖出止盈：价格下跌
+        # 卖出/NO止盈：价格下跌
         profit_price = entry * (Decimal("1") - pct)
     
     return profit_price.quantize(Decimal("0.0001"), rounding=ROUNDING_MODE)
