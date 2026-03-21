@@ -122,6 +122,8 @@ class CopyTradingConfig:
     position_sync_interval: int = 300
     # 目标钱包列表 (可选，auto_discover=True时可留空)
     target_wallets: List[str] = field(default_factory=list)
+    # 种子钱包列表 (扇动发现的已知优质钱包，跟 auto_discover 并行工作)
+    seed_wallets: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -243,6 +245,13 @@ class Settings:
         if wallets_str:
             settings.copy_trading.target_wallets = [
                 w.strip() for w in wallets_str.split(",") if w.strip()
+            ]
+        
+        # 加载种子钱包列表 (已知优质钱包，优先分析)
+        seed_str = os.getenv("SEED_WALLETS", "")
+        if seed_str:
+            settings.copy_trading.seed_wallets = [
+                w.strip() for w in seed_str.split(",") if w.strip()
             ]
         
         # 加载WebSocket配置

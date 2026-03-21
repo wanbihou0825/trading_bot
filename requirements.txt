@@ -6,6 +6,9 @@ web3>=6.0.0
 # Ethereum 账户管理 (L2 API 签名必需!)
 eth_account>=0.10.0
 
+# Polymarket 官方 CLOB 客户端 (L2 认证 & 订单签名)
+py-clob-client>=0.11.0
+
 # 异步HTTP客户端
 aiohttp>=3.9.0
 
@@ -20,6 +23,9 @@ pandas>=2.0.0
 
 # 类型检查支持
 typing-extensions>=4.0.0
+
+# 异步数据库
+aiosqlite>=0.19.0
 
 # ─── 生产级安全功能依赖 ───
 
@@ -37,7 +43,3 @@ pytest>=7.0.0
 pytest-asyncio>=0.21.0
 pytest-cov>=4.0.0
 pytest-mock>=3.11.0
-
-# 代码格式化 (开发依赖)
-black>=23.0.0
-isort>=5.12.0

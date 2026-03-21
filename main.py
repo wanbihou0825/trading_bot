@@ -175,14 +175,17 @@ class TradingBot:
             enabled=bool(self.settings.telegram_bot_token)
         )
         
-        # 注册熔断器触发回调
+        # 注册熔断器触发回调（异常隔离）
         async def on_circuit_breaker_trigger(reason: str):
-            await self.telegram.send_message(
-                f"🚨 熔断器触发\n"
-                f"原因: {reason}\n"
-                f"时间: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}\n"
-                f"交易已暂停，请检查策略或手动重置。"
-            )
+            try:
+                await self.telegram.send_message(
+                    f"🚨 熔断器触发\n"
+                    f"原因: {reason}\n"
+                    f"时间: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}\n"
+                    f"交易已暂停，请检查策略或手动重置。"
+                )
+            except Exception as e:
+                logger.error(f"熔断器通知发送失败: {e}")
         
         self.circuit_breaker.on_trigger(on_circuit_breaker_trigger)
         
@@ -256,6 +259,8 @@ class TradingBot:
             mm_detector=self.market_maker_detector,
             warning_detector=self.warning_detector,
             polygonscan_api_key=self.settings.polygonscan_api_key,
+            polymarket_client=self.client,
+            seed_wallets=self.settings.copy_trading.seed_wallets,
             min_quality_score=self.settings.wallet_quality.min_quality_score,
             min_win_rate=self.settings.wallet_quality.min_win_rate,
             min_trades=self.settings.wallet_quality.min_trades,
@@ -341,9 +346,20 @@ class TradingBot:
         if not await self.client.connect():
             raise InitializationError("无法连接到 Polymarket API")
         
+        # 连接持久化数据库
+        await self.persistence.connect()
+        
+        # 注入持久化到 risk_manager
+        self.risk_manager.set_persistence(self.persistence)
+        
+        # 从数据库恢复仓位（崩溃恢复）
+        restored = await self.risk_manager.restore_positions()
+        if restored:
+            logger.info(f"✅ 恢复了 {restored} 个持仓")
+        
         # 获取初始余额
         balance = await self.client.get_account_balance()
-        if balance:
+        if balance is not None:
             self.risk_manager.update_balance(balance)
             logger.info(f"账户余额: ${balance:.2f}")
             
@@ -432,11 +448,15 @@ class TradingBot:
         
         # ─── 停止生产级安全功能 ───
         
-        # 停止紧急停止监控
-        await self.emergency_stop.stop()
+        try:
+            await self.emergency_stop.stop()
+        except Exception as e:
+            logger.error(f"停止紧急停止监控异常: {e}")
         
-        # 停止监控服务
-        await self.monitoring.stop()
+        try:
+            await self.monitoring.stop()
+        except Exception as e:
+            logger.error(f"停止监控服务异常: {e}")
         
         # 取消所有任务
         if self._main_tasks:
@@ -444,7 +464,6 @@ class TradingBot:
             for task in self._main_tasks:
                 if not task.done():
                     task.cancel()
-            # 等待任务取消完成
             try:
                 await asyncio.gather(*self._main_tasks, return_exceptions=True)
             except Exception as e:
@@ -452,23 +471,52 @@ class TradingBot:
             self._main_tasks = []
         
         # 停止钱包扫描器
-        await self.wallet_scanner.stop()
+        try:
+            await self.wallet_scanner.stop()
+        except Exception as e:
+            logger.error(f"停止钱包扫描器异常: {e}")
         
         # 停止钱包监控
-        await self.wallet_monitor.stop()
+        try:
+            await self.wallet_monitor.stop()
+        except Exception as e:
+            logger.error(f"停止钱包监控异常: {e}")
         
         # 断开WebSocket
         if self.ws_manager:
-            await self.ws_manager.disconnect()
+            try:
+                await self.ws_manager.disconnect()
+            except Exception as e:
+                logger.error(f"断开WebSocket异常: {e}")
         
-        # ─── 强制平仓所有持仓（兜底机制）───
-        await self.forced_liquidation.liquidate_all(reason="机器人关闭")
+        # ─── 强制平仓所有持仓（兜底机制，带超时）───
+        try:
+            await asyncio.wait_for(
+                self.forced_liquidation.liquidate_all(reason="机器人关闭"),
+                timeout=30
+            )
+        except asyncio.TimeoutError:
+            logger.error("强制平仓超时 (30s)，跳过")
+        except Exception as e:
+            logger.error(f"强制平仓异常: {e}")
+        
+        # 关闭持久化数据库
+        try:
+            await self.persistence.close()
+        except Exception as e:
+            logger.error(f"关闭数据库异常: {e}")
         
         # 断开连接
-        await self.client.disconnect()
+        try:
+            await self.client.disconnect()
+        except Exception as e:
+            logger.error(f"断开连接异常: {e}")
         
         # 发送停止通知
-        await self.telegram.send_shutdown_notification("用户请求停止")
+        try:
+            await self.telegram.send_shutdown_notification("用户请求停止")
+        except Exception as e:
+            logger.error(f"发送停止通知异常: {e}")
         
         # 记录审计日志
         if self.audit_logger:
@@ -750,7 +798,7 @@ class TradingBot:
         
         if order_result.success:
             # 开仓记录
-            position = self.risk_manager.open_position(
+            position = await self.risk_manager.open_position(
                 market_id=market_data.market_id,
                 market_question=market_data.question,
                 side=side,
@@ -802,10 +850,20 @@ class TradingBot:
         
         # 获取所有持仓市场的当前价格
         market_prices = {}
-        for market_id in positions:
+        for market_id, position in list(positions.items()):  # 用 list() 复制防止迭代中修改
             price_data = await self.client.get_market_price(market_id)
             if price_data:
-                market_prices[market_id] = price_data.get("yes", Decimal("0.5"))
+                # 根据持仓方向用对应价格（YES用yes价，NO用no价）
+                if position.side == "YES":
+                    price = price_data.get("yes")
+                else:
+                    price = price_data.get("no")
+                if price is not None:
+                    market_prices[market_id] = price
+                else:
+                    logger.warning(f"获取市场 {market_id} 价格异常，跳过退出检查")
+            else:
+                logger.warning(f"无法获取市场 {market_id} 价格，跳过退出检查")
         
         # 检查退出条件
         exits = self.risk_manager.check_position_exits(market_prices)
@@ -819,7 +877,7 @@ class TradingBot:
         exit_price = exit_info["exit_price"]
         reason = exit_info["reason"]
         
-        position = self.risk_manager.close_position(market_id, exit_price)
+        position = await self.risk_manager.close_position(market_id, exit_price)
         if position:
             # ─── 记录交易日志 ───
             if self.trade_logger:
@@ -842,9 +900,9 @@ class TradingBot:
                 reason=reason
             )
             
-            # 更新预期余额
-            revenue = position.size * exit_price
-            self.monitoring.balance.update_expected_balance(revenue)
+            # 更新预期余额：加回净盈亏，不是全额收入
+            pnl = position.pnl  # (exit_price - entry_price) * size
+            self.monitoring.balance.update_expected_balance(pnl)
     
     async def _close_all_positions(self, reason: str) -> None:
         """平掉所有持仓"""

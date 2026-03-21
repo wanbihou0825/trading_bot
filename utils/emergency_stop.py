@@ -273,7 +273,7 @@ class ForcedLiquidation:
                         raise ValueError(f"平仓订单失败: {order.error}")
                 
                 # 记录平仓
-                closed_position = self.risk_manager.close_position(
+                closed_position = await self.risk_manager.close_position(
                     market_id=market_id,
                     exit_price=exit_price
                 )
@@ -373,7 +373,7 @@ class ForcedLiquidation:
                     raise ValueError(f"订单失败: {order.error}")
             
             # 记录平仓
-            closed = self.risk_manager.close_position(market_id, exit_price)
+            closed = await self.risk_manager.close_position(market_id, exit_price)
             
             if closed:
                 logger.info(

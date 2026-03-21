@@ -6,9 +6,10 @@
 """
 
 import asyncio
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from decimal import Decimal
-from typing import Optional, List, Dict, Any, Callable, Set
+from typing import Optional, List, Dict, Any, Callable
 from datetime import datetime, timezone, timedelta
 from enum import Enum
 import aiohttp
@@ -110,8 +111,8 @@ class WalletMonitor:
         # 交易回调
         self._trade_callbacks: List[Callable] = []
         
-        # 已处理的交易缓存
-        self._processed_txs: Set[str] = set()
+        # 已处理的交易缓存 (OrderedDict 实现 FIFO)
+        self._processed_txs: OrderedDict[str, None] = OrderedDict()
         self._max_cache_size = 10000
         
         # 运行状态
@@ -386,7 +387,7 @@ class WalletMonitor:
         if not tx_hash or tx_hash in self._processed_txs:
             return
         
-        self._processed_txs.add(tx_hash)
+        self._processed_txs[tx_hash] = None
         self._cleanup_cache()
         
         # 获取完整交易详情
@@ -405,7 +406,7 @@ class WalletMonitor:
                 
                 for tx in txs:
                     if tx.tx_hash not in self._processed_txs:
-                        self._processed_txs.add(tx.tx_hash)
+                        self._processed_txs[tx.tx_hash] = None
                         await self._notify_trade(tx)
                 
                 wallet_info.last_checked = datetime.now(timezone.utc)
@@ -507,13 +508,9 @@ class WalletMonitor:
                 logger.error(f"回调执行异常: {e}")
     
     def _cleanup_cache(self) -> None:
-        """清理缓存"""
-        if len(self._processed_txs) > self._max_cache_size:
-            # 移除一半的旧记录
-            to_remove = len(self._processed_txs) - self._max_cache_size // 2
-            for _ in range(to_remove):
-                if self._processed_txs:
-                    self._processed_txs.pop()
+        """清理缓存 (FIFO 顺序移除最旧记录)"""
+        while len(self._processed_txs) > self._max_cache_size:
+            self._processed_txs.popitem(last=False)
     
     @property
     def is_running(self) -> bool:

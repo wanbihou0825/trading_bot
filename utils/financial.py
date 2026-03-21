@@ -101,10 +101,10 @@ def calculate_pnl(
     
     if side.upper() == "BUY":
         # 买入：价格上涨盈利
-        pnl = (exit_p - entry) * size / entry
+        pnl = (exit_p - entry) * size
     else:
         # 卖出：价格下跌盈利
-        pnl = (entry - exit_p) * size / entry
+        pnl = (entry - exit_p) * size
     
     return pnl.quantize(Decimal("0.01"), rounding=ROUNDING_MODE)
 

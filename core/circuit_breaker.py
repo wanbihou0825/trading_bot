@@ -198,12 +198,17 @@ class CircuitBreaker:
         
         logger.warning(f"⚠️ 熔断器触发 | 原因: {reason}")
         
-        # 调用所有回调
+        # 调用所有回调（异常隔离，防止回调失败影响熔断逻辑）
         for callback in self._trigger_callbacks:
             try:
-                # 尝试异步调用
                 if asyncio.iscoroutinefunction(callback):
-                    asyncio.create_task(callback(reason))
+                    # 在后台运行，但包裹异常处理
+                    async def _safe_callback(cb=callback, r=reason):
+                        try:
+                            await cb(r)
+                        except Exception as e:
+                            logger.error(f"熔断回调异步执行失败: {e}")
+                    asyncio.create_task(_safe_callback())
                 else:
                     callback(reason)
             except Exception as e:

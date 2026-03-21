@@ -12,8 +12,8 @@
 import asyncio
 from dataclasses import dataclass, field
 from decimal import Decimal
-from typing import Optional, List, Dict, Any, Set
-from datetime import datetime, timezone
+from typing import Optional, List, Dict, Any, Set, Tuple
+from datetime import datetime, timezone, timedelta
 from enum import Enum
 
 from utils.logger import get_logger
@@ -58,7 +58,7 @@ class CopyConfig:
     # 平仓跟单配置
     follow_close: bool = True  # 是否跟平仓
     close_on_target_close: bool = True  # 目标平仓时自动平仓
-    position_sync_interval: int = 300  # 持仓同步间隔(秒)，可通过环境变量配置
+    position_sync_interval: int = 60  # 持仓同步间隔(秒)，从300缩短到60
 
 
 @dataclass
@@ -142,8 +142,10 @@ class CopyExecutor:
         self.config = copy_config or CopyConfig()
         self.persistence = persistence  # 持久化管理器
         
-        # 钱包评分缓存
+        # 钱包评分缓存 (带过期时间)
         self._wallet_scores: Dict[str, QualityScore] = {}
+        self._wallet_scores_time: Dict[str, datetime] = {}  # 缓存时间
+        self._score_ttl = timedelta(hours=1)  # 评分缓存1小时过期
         
         # 跟单记录
         self._copy_trades: List[CopyTrade] = []
@@ -154,7 +156,9 @@ class CopyExecutor:
         # 跟踪的持仓: key = f"{wallet_address}:{market_id}"
         self._tracked_positions: Dict[str, TrackedPosition] = {}
         
-        # 持仓同步任务
+        # 并发保护锁
+        self._position_lock = asyncio.Lock()  # 保护 _tracked_positions
+        self._open_lock = asyncio.Lock()  # 防止同市场双开
         self._sync_task: Optional[asyncio.Task] = None
         self._running = False
         
@@ -257,107 +261,130 @@ class CopyExecutor:
             logger.info(f"跟单金额过小: ${copy_amount}")
             return None
         
-        # 4. 检查是否已有该市场持仓
-        existing_position = self.risk_manager.get_position(tx.market_id)
-        if existing_position:
-            logger.info(f"已有该市场持仓，跳过开仓")
-            return None
-        
-        # 5. 风险检查
-        risk_result = self.risk_manager.check_trade(
-            market_id=tx.market_id,
-            side=tx.side,
-            requested_size=copy_amount,
-            confidence_score=score.overall_score / Decimal("10"),
-            price=tx.price
-        )
-        
-        if not risk_result.allowed:
-            logger.info(f"风险检查未通过: {risk_result.reason}")
-            return None
-        
-        final_amount = risk_result.suggested_size or copy_amount
-        
-        # 6. 创建跟单记录
-        copy_trade = CopyTrade(
-            source_wallet=tx.wallet_address,
-            source_tx_hash=tx.tx_hash,
-            market_id=tx.market_id,
-            market_question=tx.market_question,
-            side=tx.side,
-            action=CopyAction.OPEN,
-            original_size=tx.size,
-            copy_size=final_amount,
-            copy_price=tx.price,
-        )
-        
-        # 7. 添加延迟
-        await asyncio.sleep(self.config.copy_delay_seconds)
-        
-        # 8. 执行开仓
-        try:
-            order_result = await self._execute_open(copy_trade)
+        # 4. 检查是否已有该市场持仓 (加锁防止双开)
+        async with self._open_lock:
+            existing_position = self.risk_manager.get_position(tx.market_id)
+            if existing_position:
+                logger.info(f"已有该市场持仓，跳过开仓")
+                return None
             
-            if order_result.success:
-                copy_trade.order_id = order_result.order_id
-                copy_trade.status = "filled"
-                copy_trade.executed_at = datetime.now(timezone.utc)
+            # 5. 风险检查
+            risk_result = self.risk_manager.check_trade(
+                market_id=tx.market_id,
+                side=tx.side,
+                requested_size=copy_amount,
+                confidence_score=score.overall_score / Decimal("10"),
+                price=tx.price
+            )
+            
+            if not risk_result.allowed:
+                logger.info(f"风险检查未通过: {risk_result.reason}")
+                return None
+            
+            final_amount = risk_result.suggested_size or copy_amount
+            
+            # 5.5 幂等性检查（防止超时重试导致重复下单）
+            idempotency_key = f"{tx.tx_hash}:{tx.market_id}"
+            if self.persistence:
+                existing = await self.persistence.check_idempotency(idempotency_key)
+                if existing:
+                    logger.info(f"幂等性拦截，订单已存在 | key: {idempotency_key[:20]}...")
+                    return None
+            
+            # 6. 创建跟单记录
+            copy_trade = CopyTrade(
+                source_wallet=tx.wallet_address,
+                source_tx_hash=tx.tx_hash,
+                market_id=tx.market_id,
+                market_question=tx.market_question,
+                side=tx.side,
+                action=CopyAction.OPEN,
+                original_size=tx.size,
+                copy_size=final_amount,
+                copy_price=tx.price,
+            )
+            
+            # 7. 添加延迟
+            await asyncio.sleep(self.config.copy_delay_seconds)
+            
+            # 8. 执行开仓 (在锁内执行，防止并发双开)
+            try:
+                order_result = await self._execute_open(copy_trade)
                 
-                # 记录持仓
-                self.risk_manager.open_position(
-                    market_id=copy_trade.market_id,
-                    market_question=copy_trade.market_question,
-                    side=copy_trade.side,
-                    price=order_result.filled_price,
-                    size=order_result.filled_size
-                )
-                
-                # 跟踪持仓
-                self._track_position(
-                    wallet_address=tx.wallet_address,
-                    market_id=tx.market_id,
-                    side=tx.side,
-                    source_size=tx.size,
-                    our_size=order_result.filled_size
-                )
-                
-                logger.info(
-                    f"跟单开仓成功 | 市场: {copy_trade.market_question[:30]}... | "
-                    f"方向: {copy_trade.side} | 金额: ${copy_trade.copy_size}"
-                )
-                
-                # 标记为已处理（幂等性）
-                if self.persistence:
-                    await self.persistence.mark_processed(
-                        tx_hash=tx.tx_hash,
-                        wallet_address=tx.wallet_address,
-                        market_id=tx.market_id,
-                        action="open",
-                        status="success",
-                        copy_size=order_result.filled_size,
-                        copy_price=order_result.filled_price
-                    )
-                
-                # 发送通知
-                if self.telegram:
-                    await self.telegram.send_trade_notification(
-                        action="跟单开仓",
+                if order_result.success:
+                    copy_trade.order_id = order_result.order_id
+                    copy_trade.status = "filled"
+                    copy_trade.executed_at = datetime.now(timezone.utc)
+                    
+                    # 记录幂等性
+                    if self.persistence:
+                        await self.persistence.save_idempotency(
+                            key=idempotency_key,
+                            market_id=tx.market_id,
+                            side=tx.side,
+                            size=order_result.filled_size,
+                            status="filled",
+                            order_id=order_result.order_id,
+                        )
+                    
+                    # 记录持仓
+                    await self.risk_manager.open_position(
+                        market_id=copy_trade.market_id,
                         market_question=copy_trade.market_question,
                         side=copy_trade.side,
-                        amount=copy_trade.copy_size,
                         price=order_result.filled_price,
-                        confidence=score.overall_score / Decimal("10"),
-                        strategy=f"copy_{score.tier.value}"
+                        size=order_result.filled_size
                     )
-            else:
-                copy_trade.status = "failed"
-                copy_trade.error = order_result.error
-                logger.error(f"跟单开仓失败: {order_result.error}")
-                
-        except Exception as e:
-            copy_trade.status = "error"
-            copy_trade.error = str(e)
-            logger.error(f"跟单开仓异常: {e}")
+                    
+                    # 跟踪持仓
+                    self._track_position(
+                        wallet_address=tx.wallet_address,
+                        market_id=tx.market_id,
+                        side=tx.side,
+                        source_size=tx.size,
+                        our_size=order_result.filled_size
+                    )
+                    
+                    logger.info(
+                        f"跟单开仓成功 | 市场: {copy_trade.market_question[:30]}... | "
+                        f"方向: {copy_trade.side} | 金额: ${copy_trade.copy_size}"
+                    )
+                    
+                    # 标记为已处理（幂等性）
+                    if self.persistence:
+                        await self.persistence.mark_processed(
+                            tx_hash=tx.tx_hash,
+                            wallet_address=tx.wallet_address,
+                            market_id=tx.market_id,
+                            action="open",
+                            status="success",
+                            copy_size=order_result.filled_size,
+                            copy_price=order_result.filled_price
+                        )
+                    
+                    # 发送通知
+                    if self.telegram:
+                        try:
+                            await self.telegram.send_trade_notification(
+                            action="跟单开仓",
+                            market_question=copy_trade.market_question,
+                            side=copy_trade.side,
+                            amount=copy_trade.copy_size,
+                            price=order_result.filled_price,
+                            confidence=score.overall_score / Decimal("10"),
+                            strategy=f"copy_{score.tier.value}"
+                        )
+                        except Exception as e:
+                            logger.error(f"发送开仓通知失败: {e}")
+                else:
+                    copy_trade.status = "failed"
+                    copy_trade.error = order_result.error
+                    logger.error(f"跟单开仓失败: {order_result.error}")
+                    
+            except Exception as e:
+                copy_trade.status = "error"
+                copy_trade.error = str(e)
+                logger.error(f"跟单开仓异常: {e}")
         
         self._copy_trades.append(copy_trade)
         return copy_trade
@@ -374,7 +401,8 @@ class CopyExecutor:
         
         # 查找我们是否跟了这个持仓
         track_key = f"{tx.wallet_address.lower()}:{tx.market_id}"
-        tracked = self._tracked_positions.get(track_key)
+        async with self._position_lock:
+            tracked = self._tracked_positions.get(track_key)
         
         if not tracked:
             logger.debug(f"未跟踪该持仓，跳过平仓: {track_key}")
@@ -386,7 +414,8 @@ class CopyExecutor:
         if not our_position:
             logger.info(f"已无该市场持仓，无需平仓")
             # 清理跟踪记录
-            del self._tracked_positions[track_key]
+            async with self._position_lock:
+                self._tracked_positions.pop(track_key, None)
             return None
         
         # 检查方向是否匹配
@@ -421,14 +450,14 @@ class CopyExecutor:
                 copy_trade.executed_at = datetime.now(timezone.utc)
                 
                 # 记录平仓
-                closed_position = self.risk_manager.close_position(
+                closed_position = await self.risk_manager.close_position(
                     market_id=tx.market_id,
                     exit_price=order_result.filled_price
                 )
                 
                 # 清理跟踪记录
-                if track_key in self._tracked_positions:
-                    del self._tracked_positions[track_key]
+                async with self._position_lock:
+                    self._tracked_positions.pop(track_key, None)
                 
                 logger.info(
                     f"跟单平仓成功 | 市场: {copy_trade.market_question[:30]}... | "
@@ -449,14 +478,17 @@ class CopyExecutor:
                 
                 # 发送通知
                 if self.telegram and closed_position:
-                    pnl_type = "盈利" if closed_position.pnl >= 0 else "亏损"
-                    await self.telegram.send_message(
-                        f"📤 跟单平仓\n"
-                        f"市场: {copy_trade.market_question[:40]}...\n"
-                        f"方向: {copy_trade.side}\n"
-                        f"{pnl_type}: ${abs(closed_position.pnl):.2f}\n"
-                        f"收益率: {closed_position.pnl_percentage:.1f}%"
-                    )
+                    try:
+                        pnl_type = "盈利" if closed_position.pnl >= 0 else "亏损"
+                        await self.telegram.send_message(
+                            f"📤 跟单平仓\n"
+                            f"市场: {copy_trade.market_question[:40]}...\n"
+                            f"方向: {copy_trade.side}\n"
+                            f"{pnl_type}: ${abs(closed_position.pnl):.2f}\n"
+                            f"收益率: {closed_position.pnl_percentage:.1f}%"
+                        )
+                    except Exception as e:
+                        logger.error(f"发送平仓通知失败: {e}")
             else:
                 copy_trade.status = "failed"
                 copy_trade.error = order_result.error
@@ -507,8 +539,9 @@ class CopyExecutor:
     
     async def _sync_positions(self) -> None:
         """同步持仓状态"""
-        # 获取所有跟踪的持仓
-        positions_to_check = list(self._tracked_positions.items())
+        # 获取所有跟踪的持仓 (加锁复制快照)
+        async with self._position_lock:
+            positions_to_check = list(self._tracked_positions.items())
         
         for track_key, tracked in positions_to_check:
             try:
@@ -571,22 +604,25 @@ class CopyExecutor:
         
         if order_result.success:
             copy_trade.status = "filled"
-            closed = self.risk_manager.close_position(
+            closed = await self.risk_manager.close_position(
                 market_id=tracked.market_id,
                 exit_price=order_result.filled_price
             )
             
             # 清理跟踪
-            track_key = f"{tracked.source_wallet.lower()}:{tracked.market_id}"
-            if track_key in self._tracked_positions:
-                del self._tracked_positions[track_key]
+            async with self._position_lock:
+                track_key = f"{tracked.source_wallet.lower()}:{tracked.market_id}"
+                self._tracked_positions.pop(track_key, None)
             
             if self.telegram and closed:
-                await self.telegram.send_message(
-                    f"🔄 自动同步平仓\n"
-                    f"市场: {our_position.market_question[:40]}...\n"
-                    f"原因: 目标钱包已平仓"
-                )
+                try:
+                    await self.telegram.send_message(
+                        f"🔄 自动同步平仓\n"
+                        f"市场: {our_position.market_question[:40]}...\n"
+                        f"原因: 目标钱包已平仓"
+                    )
+                except Exception as e:
+                    logger.error(f"发送自动平仓通知失败: {e}")
         
         self._copy_trades.append(copy_trade)
     
@@ -602,7 +638,7 @@ class CopyExecutor:
         source_size: Decimal,
         our_size: Decimal,
     ) -> None:
-        """跟踪持仓"""
+        """跟踪持仓 (不需要异步锁，因为已在 _open_lock 内调用)"""
         key = f"{wallet_address.lower()}:{market_id}"
         self._tracked_positions[key] = TrackedPosition(
             source_wallet=wallet_address,
@@ -613,9 +649,14 @@ class CopyExecutor:
         )
     
     async def _get_wallet_score(self, wallet_address: str) -> QualityScore:
-        """获取钱包评分"""
+        """获取钱包评分 (带1小时TTL缓存)"""
+        now = datetime.now(timezone.utc)
         if wallet_address in self._wallet_scores:
-            return self._wallet_scores[wallet_address]
+            cached_time = self._wallet_scores_time.get(wallet_address)
+            if cached_time and (now - cached_time) < self._score_ttl:
+                return self._wallet_scores[wallet_address]
+            # 过期了，清除缓存
+            logger.debug(f"钱包评分缓存过期: {wallet_address[:10]}...")
         
         trades = await self._fetch_wallet_trades(wallet_address)
         self._wallet_trades[wallet_address] = trades
@@ -628,6 +669,7 @@ class CopyExecutor:
             logger.warning(f"检测到做市商: {wallet_address[:10]}...")
         
         self._wallet_scores[wallet_address] = score
+        self._wallet_scores_time[wallet_address] = now
         return score
     
     async def _fetch_wallet_trades(

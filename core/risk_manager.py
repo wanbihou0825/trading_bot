@@ -4,8 +4,9 @@
 管理交易风险，包括仓位控制、止损止盈等。
 """
 
+import asyncio
 from decimal import Decimal
-from typing import Optional, Dict, List
+from typing import Optional, Dict, List, TYPE_CHECKING
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
@@ -16,6 +17,9 @@ from utils.financial import (
     calculate_take_profit_price
 )
 from .circuit_breaker import CircuitBreaker
+
+if TYPE_CHECKING:
+    from utils.trade_persistence import TradePersistence
 
 logger = get_logger(__name__)
 
@@ -112,6 +116,10 @@ class RiskManager:
         
         # 持仓跟踪
         self._positions: Dict[str, Position] = {}
+        self._positions_lock = asyncio.Lock()
+        
+        # 持久化（可选，由外部注入）
+        self._persistence: Optional["TradePersistence"] = None
         
         # 账户余额（需要外部更新）
         self._account_balance = Decimal("0")
@@ -123,6 +131,33 @@ class RiskManager:
             f"总敞口限制: ${max_total_exposure}"
         )
     
+    def set_persistence(self, persistence: "TradePersistence") -> None:
+        """设置持久化管理器"""
+        self._persistence = persistence
+
+    async def restore_positions(self) -> int:
+        """从数据库恢复仓位（崩溃恢复）"""
+        if not self._persistence:
+            return 0
+        rows = await self._persistence.load_rm_positions()
+        async with self._positions_lock:
+            for row in rows:
+                pos = Position(
+                    market_id=row["market_id"],
+                    market_question=row["market_question"],
+                    side=row["side"],
+                    entry_price=row["entry_price"],
+                    current_price=row["current_price"],
+                    size=row["size"],
+                    stop_loss_price=row.get("stop_loss_price"),
+                    take_profit_price=row.get("take_profit_price"),
+                    opened_at=datetime.fromisoformat(row["opened_at"]) if isinstance(row["opened_at"], str) else row["opened_at"],
+                )
+                self._positions[pos.market_id] = pos
+        if rows:
+            logger.info(f"从数据库恢复了 {len(rows)} 个仓位")
+        return len(rows)
+
     def update_balance(self, balance: Decimal) -> None:
         """更新账户余额"""
         self._account_balance = balance
@@ -215,7 +250,7 @@ class RiskManager:
             warnings=warnings
         )
     
-    def open_position(
+    async def open_position(
         self,
         market_id: str,
         market_question: str,
@@ -227,20 +262,7 @@ class RiskManager:
     ) -> Position:
         """
         开仓
-        
-        Args:
-            market_id: 市场ID
-            market_question: 市场问题
-            side: 方向
-            price: 入场价格
-            size: 仓位大小
-            stop_loss_pct: 止损比例
-            take_profit_pct: 止盈比例
-        
-        Returns:
-            持仓信息
         """
-        # 计算止损止盈价格
         sl_pct = stop_loss_pct or self.default_stop_loss_pct
         tp_pct = take_profit_pct or self.default_take_profit_pct
         
@@ -258,7 +280,25 @@ class RiskManager:
             take_profit_price=take_profit
         )
         
-        self._positions[market_id] = position
+        async with self._positions_lock:
+            self._positions[market_id] = position
+        
+        # 持久化
+        if self._persistence:
+            try:
+                await self._persistence.save_rm_position({
+                    "market_id": market_id,
+                    "market_question": market_question,
+                    "side": side,
+                    "entry_price": price,
+                    "current_price": price,
+                    "size": size,
+                    "stop_loss_price": stop_loss,
+                    "take_profit_price": take_profit,
+                    "opened_at": position.opened_at.isoformat(),
+                })
+            except Exception as e:
+                logger.error(f"持久化仓位失败: {e}")
         
         logger.info(
             f"开仓成功 | 市场: {market_question[:30]}... | "
@@ -268,26 +308,20 @@ class RiskManager:
         
         return position
     
-    def close_position(
+    async def close_position(
         self,
         market_id: str,
         exit_price: Decimal
     ) -> Optional[Position]:
         """
         平仓
-        
-        Args:
-            market_id: 市场ID
-            exit_price: 平仓价格
-        
-        Returns:
-            已平仓的持仓信息
         """
-        if market_id not in self._positions:
-            logger.warning(f"未找到持仓: {market_id}")
-            return None
+        async with self._positions_lock:
+            if market_id not in self._positions:
+                logger.warning(f"未找到持仓: {market_id}")
+                return None
+            position = self._positions.pop(market_id)
         
-        position = self._positions.pop(market_id)
         position.current_price = exit_price
         
         # 记录交易结果到熔断器
@@ -295,6 +329,13 @@ class RiskManager:
             pnl=position.pnl,
             volume=position.size
         )
+        
+        # 从持久化中删除
+        if self._persistence:
+            try:
+                await self._persistence.remove_rm_position(market_id)
+            except Exception as e:
+                logger.error(f"删除持久化仓位失败: {e}")
         
         pnl_type = "盈利" if position.pnl >= 0 else "亏损"
         logger.info(
@@ -360,7 +401,7 @@ class RiskManager:
         return exits
     
     def get_positions(self) -> Dict[str, Position]:
-        """获取所有持仓"""
+        """获取所有持仓（返回 snapshot ）"""
         return self._positions.copy()
     
     def get_position(self, market_id: str) -> Optional[Position]:
@@ -370,20 +411,19 @@ class RiskManager:
     @property
     def total_position_value(self) -> Decimal:
         """总持仓价值"""
-        return sum(p.size * p.current_price for p in self._positions.values())
+        positions = self._positions.copy()
+        return sum(p.size * p.current_price for p in positions.values())
     
     @property
     def total_pnl(self) -> Decimal:
         """总盈亏"""
-        return sum(p.pnl for p in self._positions.values())
+        positions = self._positions.copy()
+        return sum(p.pnl for p in positions.values())
     
     def get_total_exposure(self) -> Decimal:
-        """
-        获取当前总敞口
-        
-        总敞口 = 所有持仓的入场价值之和
-        """
-        return sum(p.size * p.entry_price for p in self._positions.values())
+        """获取当前总敞口"""
+        positions = self._positions.copy()
+        return sum(p.size * p.entry_price for p in positions.values())
     
     def get_status(self) -> dict:
         """获取风险管理器状态"""

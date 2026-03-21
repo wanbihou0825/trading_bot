@@ -5,6 +5,7 @@ Polymarket客户端单元测试
 """
 
 import pytest
+import asyncio
 from decimal import Decimal
 from unittest.mock import AsyncMock, patch, MagicMock
 import aiohttp
@@ -20,17 +21,16 @@ class TestPolymarketClient:
         client = PolymarketClient(dry_run=True)
         
         assert client.dry_run is True
-        assert client.api_url == "https://clob.polymarket.com"
     
     def test_initialization_production(self):
         """测试初始化 - 生产模式"""
         client = PolymarketClient(
-            api_url="https://custom.api.com",
-            dry_run=False
+            private_key="0x" + "ab" * 32,
+            wallet_address="0x" + "cd" * 20,
+            dry_run=False,
         )
         
         assert client.dry_run is False
-        assert client.api_url == "https://custom.api.com"
     
     @pytest.mark.asyncio
     async def test_connect_dry_run(self):
@@ -41,6 +41,7 @@ class TestPolymarketClient:
         
         assert result is True
         assert client.is_connected is True
+        await client.disconnect()
     
     @pytest.mark.asyncio
     async def test_disconnect(self):
@@ -62,12 +63,12 @@ class TestPolymarketClient:
         
         assert isinstance(markets, list)
         assert len(markets) <= 5
-        # 检查模拟数据结构
         for market in markets:
             assert "id" in market
             assert "question" in market
             assert "yes_price" in market
             assert "no_price" in market
+        await client.disconnect()
     
     @pytest.mark.asyncio
     async def test_get_market_price_dry_run(self):
@@ -81,6 +82,7 @@ class TestPolymarketClient:
         assert "yes" in price
         assert "no" in price
         assert price["yes"] + price["no"] == Decimal("1")
+        await client.disconnect()
     
     @pytest.mark.asyncio
     async def test_place_order_dry_run(self):
@@ -99,6 +101,7 @@ class TestPolymarketClient:
         assert result.order_id is not None
         assert result.filled_size == Decimal("10")
         assert result.filled_price == Decimal("0.65")
+        await client.disconnect()
     
     @pytest.mark.asyncio
     async def test_cancel_order_dry_run(self):
@@ -109,6 +112,7 @@ class TestPolymarketClient:
         result = await client.cancel_order("test_order")
         
         assert result is True
+        await client.disconnect()
     
     @pytest.mark.asyncio
     async def test_get_account_balance_dry_run(self):
@@ -119,6 +123,7 @@ class TestPolymarketClient:
         balance = await client.get_account_balance()
         
         assert balance == Decimal("1000")
+        await client.disconnect()
     
     def test_parse_market_data(self):
         """测试解析市场数据"""
@@ -146,12 +151,8 @@ class TestPolymarketClient:
         """测试解析无效市场数据"""
         client = PolymarketClient(dry_run=True)
         
-        # 缺少必要字段
         market_info = {"id": "test"}
-        
         market_data = client.parse_market_data(market_info)
-        
-        # 应该返回MarketData对象，即使数据不完整
         assert market_data is not None
 
 
@@ -217,7 +218,7 @@ class TestRetryDecorator:
         with pytest.raises(aiohttp.ClientError):
             await always_failing()
         
-        assert call_count == 3  # 1次初始 + 2次重试
+        assert call_count == 3
     
     @pytest.mark.asyncio
     async def test_no_retry_on_non_retryable(self):
@@ -233,7 +234,7 @@ class TestRetryDecorator:
         with pytest.raises(ValueError):
             await non_retryable_error()
         
-        assert call_count == 1  # 只调用一次，不重试
+        assert call_count == 1
     
     @pytest.mark.asyncio
     async def test_success_no_retry(self):

@@ -6,13 +6,11 @@ Polymarket 客户端模块
 支持:
 - Gamma API (市场元数据)
 - Data API (用户活动/持仓)
-- CLOB API (交易执行，L2 认证)
+- CLOB API (交易执行，L2 认证 — 通过官方 py-clob-client)
 """
 
 import asyncio
 import functools
-import hashlib
-import hmac
 import time
 from decimal import Decimal
 from typing import Optional, Dict, List, Any, Callable
@@ -108,17 +106,17 @@ class PolymarketClient:
     集成三个 API:
     - Gamma API: 市场发现和元数据
     - Data API: 用户活动、交易历史、持仓查询
-    - CLOB API: 交易执行 (需要 L2 认证)
+    - CLOB API: 交易执行 (通过官方 py-clob-client 处理 L2 认证和订单签名)
     """
     
     def __init__(
         self,
         private_key: str = "",
         wallet_address: str = "",
-        signature_type: SignatureType = SignatureType.POLY_GNOSIS_SAFE,  # 默认使用 Gnosis Safe proxy
-        funder_address: str = "",  # Proxy wallet 地址（资金存放地址）
+        signature_type: SignatureType = SignatureType.POLY_GNOSIS_SAFE,
+        funder_address: str = "",
         dry_run: bool = True,
-        chain_id: int = 137,  # Polygon Mainnet
+        chain_id: int = 137,
     ):
         """
         初始化客户端
@@ -130,15 +128,9 @@ class PolymarketClient:
             funder_address: Proxy wallet 地址 (资金存放地址，从 polymarket.com/settings 获取)
             dry_run: 是否为模拟模式
             chain_id: 链 ID (Polygon = 137)
-
-        重要说明:
-        - 大多数 Polymarket 用户使用 Gnosis Safe Proxy Wallet
-        - signature_type=2 对应 Gnosis Safe (通过浏览器钱包创建的 1-of-1 proxy 合约)
-        - WALLET_ADDRESS 应该是 EOA 地址 (MetaMask 地址)
-        - FUNDER_ADDRESS 应该是 Proxy 地址 (polymarket.com/settings 显示的地址)
-        - 资金（USDC、仓位）存放在 Proxy 地址，不是 EOA 地址
         """
         self.private_key = private_key
+        # 保留 lowercase 用于内部比较和 Data API 查询
         self.wallet_address = wallet_address.lower() if wallet_address else ""
         self.signature_type = signature_type
         self.funder_address = funder_address.lower() if funder_address else self.wallet_address
@@ -152,9 +144,12 @@ class PolymarketClient:
         # L2 API credentials (用于 CLOB 交易)
         self._credentials: Optional[ApiCredentials] = None
 
+        # 官方 py-clob-client 实例 (处理 EIP-712 签名和订单构建)
+        self._clob_client = None
+
         # 日志显示地址信息
         eoa_addr = wallet_address[:10] + "..." if wallet_address else "N/A"
-        proxy_addr = self.funder_address[:10] + "..." if self.funder_address else eoa_addr
+        proxy_addr = (funder_address[:10] + "...") if funder_address else eoa_addr
 
         logger.info(
             f"Polymarket客户端初始化 | "
@@ -186,7 +181,7 @@ class PolymarketClient:
             logger.info("[模拟] Polymarket API 连接成功 (模拟模式)")
             return True
 
-        # 实盘模式: 派生 L2 credentials
+        # 实盘模式: 派生 L2 credentials（带重试）
         try:
             # 先验证配置
             if not self.private_key:
@@ -200,7 +195,7 @@ class PolymarketClient:
             from eth_account import Account
             try:
                 account = Account.from_key(self.private_key)
-                logger.info(f"✓ 私钥验证成功")
+                logger.info("✓ 私钥验证成功")
                 logger.info(f"✓ 私钥对应地址: {account.address}")
 
                 if account.address.lower() != self.wallet_address.lower():
@@ -210,23 +205,47 @@ class PolymarketClient:
                         f"配置地址: {self.wallet_address}\n"
                         f"请检查 .env 文件中的 WALLET_ADDRESS 和 PRIVATE_KEY"
                     )
+            except ValueError:
+                raise
             except Exception as e:
                 raise ValueError(f"私钥格式错误: {e}")
 
             # 测试 Gamma API 连接
             logger.info("测试 Gamma API 连接...")
             async with self._session.get(
-                f"{PolymarketAPI.GAMMA_API}/markets?limit=1"
+                f"{PolymarketAPI.GAMMA_API}/markets?limit=1",
+                timeout=aiohttp.ClientTimeout(total=10)
             ) as response:
                 if response.status != 200:
                     raise ConnectionError(f"Gamma API 连接失败: {response.status}")
                 logger.info("✓ Gamma API 连接成功")
 
-            # 派生 L2 API credentials
-            logger.info("派生 L2 API credentials...")
-            self._credentials = await self._derive_api_credentials()
+            # 初始化官方 ClobClient 并派生 L2 credentials（重试3次）
+            max_retries = 3
+            last_error = None
+            for attempt in range(1, max_retries + 1):
+                try:
+                    logger.info(f"派生 L2 API credentials (尝试 {attempt}/{max_retries})...")
+                    self._credentials = await asyncio.wait_for(
+                        self._derive_api_credentials(),
+                        timeout=30
+                    )
+                    if self._credentials:
+                        break
+                    last_error = RuntimeError("derive 返回空")
+                except asyncio.TimeoutError:
+                    last_error = asyncio.TimeoutError("L2 credential derivation 超时 (30s)")
+                    logger.warning(f"L2 派生超时 (尝试 {attempt}/{max_retries})")
+                except Exception as e:
+                    last_error = e
+                    logger.warning(f"L2 派生失败 (尝试 {attempt}/{max_retries}): {e}")
+                if attempt < max_retries:
+                    delay = 2 ** attempt
+                    logger.info(f"{delay}s 后重试...")
+                    await asyncio.sleep(delay)
+
             if not self._credentials:
-                raise RuntimeError("无法派生 L2 API credentials")
+                raise RuntimeError(f"无法派生 L2 API credentials (已重试{max_retries}次): {last_error}")
 
             self._is_connected = True
             logger.info("✓ Polymarket API 连接成功")
@@ -235,180 +254,137 @@ class PolymarketClient:
         except ValueError as e:
             logger.error(f"配置错误: {e}")
             logger.error("请检查 .env 文件中的配置")
+            await self._cleanup_session_on_failure()
             return False
         except Exception as e:
             logger.error(f"连接失败: {e}")
             import traceback
             logger.error(f"异常详情:\n{traceback.format_exc()}")
+            await self._cleanup_session_on_failure()
             return False
+    
+    async def _cleanup_session_on_failure(self) -> None:
+        """connect 失败时清理 session"""
+        if self._session:
+            try:
+                await self._session.close()
+            except Exception:
+                pass
+            self._session = None
+        self._is_connected = False
     
     async def disconnect(self) -> None:
         """断开连接"""
+        self._is_connected = False
+        self._credentials = None
+        self._clob_client = None
         if self._session:
             await self._session.close()
             self._session = None
-        self._is_connected = False
-        self._credentials = None
         logger.info("已断开 Polymarket 连接")
+    
+    def _check_session(self) -> aiohttp.ClientSession:
+        """检查 session 可用性"""
+        if not self._is_connected or not self._session:
+            raise RuntimeError("未连接到 Polymarket API，请先调用 connect()")
+        return self._session
     
     @property
     def is_connected(self) -> bool:
         return self._is_connected
     
     # ═══════════════════════════════════════════════════════════════
-    # L2 API 认证 (关键修复!)
+    # L2 API 认证 (使用官方 py-clob-client)
     # ═══════════════════════════════════════════════════════════════
     
     async def _derive_api_credentials(self) -> Optional[ApiCredentials]:
         """
-        派生 L2 API credentials
-        
-        参考: py-clob-client 的 create_or_derive_api_creds()
-        通过 wallet 签名派生 apiKey, secret, passphrase
+        使用官方 py-clob-client 派生 L2 API credentials
+
+        内部流程 (由 py-clob-client 自动处理):
+        1. 构造 EIP-712 结构化签名 (ClobAuth domain)
+        2. 使用正确的 header 名称 (POLY_ADDRESS 等)
+        3. 请求 /auth/derive-api-key 端点
         """
         try:
-            # 1. 生成 timestamp
-            timestamp = int(time.time())
-            
-            # 2. 创建签名消息（符合 Polymarket 规范）
-            message = f"Authentication for Polymarket CLOB.\nTimestamp: {timestamp}"
-            
-            # 3. 使用私钥签名
-            signature = await self._sign_message(message)
-            
-            # 4. 调用 CLOB API 获取 credentials
-            payload = {
-                "signature": signature,
-                "address": self.wallet_address,
-                "timestamp": timestamp,
-                "signatureType": self.signature_type.value,
-                "chainId": str(self.chain_id),
-            }
+            from py_clob_client.client import ClobClient
 
-            # 如果是 Gnosis Safe 模式，添加 funder 参数
+            # 构建 funder 参数 (Gnosis Safe 模式需要)
+            funder = None
             if self.signature_type == SignatureType.POLY_GNOSIS_SAFE and self.funder_address:
-                payload["funder"] = self.funder_address
-                logger.info(f"使用 Proxy 地址作为 funder: {self.funder_address[:10]}...")
-            
-            # 添加必要的请求头
-            headers = {
-                "Content-Type": "application/json",
-                "Accept": "application/json",
-            }
-            
-            async with self._session.post(
-                f"{PolymarketAPI.CLOB_API}/auth/api-key",
-                json=payload,
-                headers=headers
-            ) as response:
-                response_text = await response.text()
-                
-                if response.status == 200:
-                    data = await response.json()
-                    credentials = ApiCredentials(
-                        api_key=data.get("apiKey", ""),
-                        api_secret=data.get("secret", ""),
-                        api_passphrase=data.get("passphrase", ""),
-                    )
-                    logger.info(f"API credentials 派生成功: {credentials.api_key[:8]}...")
-                    return credentials
-                else:
-                    logger.error(f"派生 credentials 失败: {response.status} - {response_text}")
-                    
-                    # 额外日志帮助调试
-                    logger.error(f"请求 payload: {payload}")
-                    logger.error(f"签名消息: {message}")
-                    logger.error(f"钱包地址: {self.wallet_address}")
-                    return None
-                    
+                funder = self.funder_address
+                logger.info(f"使用 Proxy 地址作为 funder: {funder[:10]}...")
+
+            # 初始化官方客户端
+            self._clob_client = ClobClient(
+                host=PolymarketAPI.CLOB_API,
+                key=self.private_key,
+                chain_id=self.chain_id,
+                signature_type=self.signature_type.value,
+                funder=funder,
+            )
+
+            logger.info("正在通过 py-clob-client 派生 credentials...")
+
+            # 在线程中运行同步调用 (py-clob-client 使用 requests 库)
+            creds = await asyncio.to_thread(self._clob_client.derive_api_key)
+
+            if not creds:
+                logger.warning("derive_api_key 返回空，尝试 create_or_derive...")
+                creds = await asyncio.to_thread(self._clob_client.create_or_derive_api_creds)
+
+            if creds:
+                # 将 credentials 设置到 clob_client 上，后续订单签名需要
+                self._clob_client.set_api_creds(creds)
+
+                credentials = ApiCredentials(
+                    api_key=creds.api_key,
+                    api_secret=creds.api_secret,
+                    api_passphrase=creds.api_passphrase,
+                )
+                logger.info(f"✓ API credentials 派生成功: {credentials.api_key[:8]}...")
+                return credentials
+            else:
+                logger.error("派生 credentials 失败: py-clob-client 返回空")
+                return None
+
         except Exception as e:
             logger.error(f"派生 API credentials 异常: {e}")
             import traceback
             logger.error(f"异常堆栈: {traceback.format_exc()}")
             return None
-    
-    def _create_auth_message(self, nonce: str) -> str:
-        """创建认证消息"""
-        return f"Polymarket API Authentication\nNonce: {nonce}\nTimestamp: {int(time.time())}"
-    
-    async def _sign_message(self, message: str) -> str:
+
+    def _get_l2_headers(self) -> Dict[str, str]:
         """
-        使用私钥签名消息
-        
-        使用 eth_account 的标准 EIP-191 签名方法
+        生成 L2 认证请求头 (用于非订单类的认证 API 调用)
         """
-        try:
-            from eth_account import Account
-            from eth_account.messages import encode_defunct
-
-            # 使用 eth_account 签名
-            account = Account.from_key(self.private_key)
-
-            # 添加信息日志（改为 INFO 级别）
-            logger.info(f"签名消息: {message}")
-            logger.info(f"从私钥推导的地址: {account.address}")
-            logger.info(f"配置的钱包地址: {self.wallet_address}")
-
-            # 验证钱包地址是否匹配
-            if account.address.lower() != self.wallet_address.lower():
-                logger.warning(
-                    f"⚠️ 私钥地址与配置地址不匹配!\n"
-                    f"私钥地址: {account.address}\n"
-                    f"配置地址: {self.wallet_address}"
-                )
-
-            encoded_message = encode_defunct(text=message)
-            signed = account.sign_message(encoded_message)
-
-            logger.info(f"签名结果: {signed.signature.hex()[:20]}...")
-
-            return signed.signature.hex()
-
-        except ImportError as e:
-            logger.error(f"eth_account 未安装，无法签名: {e}")
-            raise RuntimeError(
-                "L2 API 认证需要 eth_account 包。"
-                "请运行: pip install eth_account>=0.10.0"
-            ) from e
-        except Exception as e:
-            logger.error(f"签名失败: {e}")
-            import traceback
-            logger.error(f"签名异常堆栈: {traceback.format_exc()}")
-            raise
-
-    def _sign_request(
-        self,
-        method: str,
-        path: str,
-        body: str = ""
-    ) -> Dict[str, str]:
-        """
-        签名 API 请求
-        
-        Returns:
-            包含认证头的字典
-        """
-        if not self._credentials:
+        if not self._clob_client or not self._credentials:
             return {}
-        
-        timestamp = str(int(time.time()))
-        
-        # 创建签名字符串
-        message = f"{timestamp}{method}{path}{body}"
-        
-        # HMAC-SHA256 签名
-        signature = hmac.new(
-            self._credentials.api_secret.encode(),
-            message.encode(),
-            hashlib.sha256
-        ).hexdigest()
-        
-        return {
-            "POLY-API-KEY": self._credentials.api_key,
-            "POLY-SIGNATURE": signature,
-            "POLY-TIMESTAMP": timestamp,
-            "POLY-PASSPHRASE": self._credentials.api_passphrase,
-        }
+
+        try:
+            # py-clob-client 内部通过 set_api_creds 已设置 creds
+            # 直接使用 HMAC 签名构造 headers
+            import hmac
+            import hashlib
+            timestamp = str(int(time.time()))
+            method = "GET"
+            request_path = "/data/balance"
+            body = ""
+            message = f"{timestamp}{method}{request_path}{body}"
+            signature = hmac.new(
+                self._credentials.api_secret.encode(),
+                message.encode(),
+                hashlib.sha256
+            ).hexdigest()
+            return {
+                "POLY_API_KEY": self._credentials.api_key,
+                "POLY_SIGNATURE": signature,
+                "POLY_TIMESTAMP": timestamp,
+                "POLY_PASSPHRASE": self._credentials.api_passphrase,
+            }
+        except Exception as e:
+            logger.error(f"生成 L2 headers 失败: {e}")
+            return {}
     
     # ═══════════════════════════════════════════════════════════════
     # Gamma API - 市场元数据 (公开)
@@ -423,11 +399,6 @@ class PolymarketClient:
     ) -> List[Dict[str, Any]]:
         """
         获取市场列表
-        
-        Args:
-            limit: 返回数量限制
-            active_only: 是否只返回活跃市场
-            slug: 市场 slug (可选)
         """
         if self.dry_run:
             return self._generate_mock_markets(limit)
@@ -439,7 +410,8 @@ class PolymarketClient:
         if slug:
             params["slug"] = slug
         
-        async with self._session.get(
+        session = self._check_session()
+        async with session.get(
             f"{PolymarketAPI.GAMMA_API}/markets",
             params=params
         ) as response:
@@ -451,7 +423,8 @@ class PolymarketClient:
     @with_retry(max_retries=3, base_delay=1.0)
     async def get_market(self, market_id_or_slug: str) -> Optional[Dict[str, Any]]:
         """获取单个市场详情"""
-        async with self._session.get(
+        session = self._check_session()
+        async with session.get(
             f"{PolymarketAPI.GAMMA_API}/markets/{market_id_or_slug}"
         ) as response:
             if response.status == 200:
@@ -489,29 +462,21 @@ class PolymarketClient:
         market_id: Optional[str] = None,
         limit: int = 50,
     ) -> List[Dict[str, Any]]:
-        """
-        获取用户交易历史 (跟单核心!)
-        
-        Args:
-            wallet_address: 目标钱包地址
-            market_id: 市场ID (可选)
-            limit: 返回数量
-        
-        Returns:
-            交易列表 [{tx_hash, market_id, side, size, price, type, timestamp}, ...]
-        """
+        """获取用户交易历史 (跟单核心!)"""
         params = {
             "user": wallet_address.lower(),
             "limit": limit,
-            "sort": "desc",  # 最新优先
+            "sort": "desc",
         }
         if market_id:
             params["market"] = market_id
         
         try:
-            async with self._session.get(
+            session = self._check_session()
+            async with session.get(
                 f"{PolymarketAPI.DATA_API}/trades",
-                params=params
+                params=params,
+                timeout=aiohttp.ClientTimeout(total=10)
             ) as response:
                 if response.status == 200:
                     return await response.json()
@@ -527,24 +492,17 @@ class PolymarketClient:
         wallet_address: str,
         market_id: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
-        """
-        获取用户当前持仓 (平仓检测核心!)
-        
-        Args:
-            wallet_address: 目标钱包地址
-            market_id: 市场ID (可选)
-        
-        Returns:
-            持仓列表 [{market_id, side, size, avg_price, current_value}, ...]
-        """
+        """获取用户当前持仓 (平仓检测核心!)"""
         params = {"user": wallet_address.lower()}
         if market_id:
             params["market"] = market_id
         
         try:
-            async with self._session.get(
+            session = self._check_session()
+            async with session.get(
                 f"{PolymarketAPI.DATA_API}/positions",
-                params=params
+                params=params,
+                timeout=aiohttp.ClientTimeout(total=10)
             ) as response:
                 if response.status == 200:
                     return await response.json()
@@ -559,19 +517,17 @@ class PolymarketClient:
         wallet_address: str,
         limit: int = 50,
     ) -> List[Dict[str, Any]]:
-        """
-        获取用户活动日志
-        
-        包括: trades, LP, redeem 等
-        """
+        """获取用户活动日志"""
         params = {
             "user": wallet_address.lower(),
             "limit": limit,
         }
         
-        async with self._session.get(
+        session = self._check_session()
+        async with session.get(
             f"{PolymarketAPI.DATA_API}/activity",
-            params=params
+            params=params,
+            timeout=aiohttp.ClientTimeout(total=10)
         ) as response:
             if response.status == 200:
                 return await response.json()
@@ -583,12 +539,7 @@ class PolymarketClient:
     
     @with_retry(max_retries=3, base_delay=1.0)
     async def get_market_price(self, market_id: str) -> Optional[Dict[str, Decimal]]:
-        """
-        获取市场价格
-        
-        Returns:
-            {"yes": Decimal, "no": Decimal, "yes_bid": Decimal, "yes_ask": Decimal, ...}
-        """
+        """获取市场价格"""
         if self.dry_run:
             import random
             yes_price = Decimal(str(round(random.uniform(0.3, 0.7), 2)))
@@ -598,17 +549,15 @@ class PolymarketClient:
             }
         
         try:
-            # 获取 token IDs
             token_ids = await self.get_token_ids(market_id)
             if not token_ids:
                 return None
             
             yes_token = token_ids.get("yes", "")
-            
-            # 获取价格
             params = {"token_id": yes_token}
             
-            async with self._session.get(
+            session = self._check_session()
+            async with session.get(
                 f"{PolymarketAPI.CLOB_API}/price",
                 params=params
             ) as response:
@@ -633,23 +582,15 @@ class PolymarketClient:
         market_id: str,
         side: str = "YES",
     ) -> Optional[Dict[str, Any]]:
-        """
-        获取订单簿
-        
-        Args:
-            market_id: 市场ID
-            side: 方向 (YES/NO)
-        
-        Returns:
-            {"bids": [{price, size}], "asks": [{price, size}]}
-        """
+        """获取订单簿"""
         token_ids = await self.get_token_ids(market_id)
         token_id = token_ids.get(side.lower(), "")
         
         if not token_id:
             return None
         
-        async with self._session.get(
+        session = self._check_session()
+        async with session.get(
             f"{PolymarketAPI.CLOB_API}/book",
             params={"token_id": token_id}
         ) as response:
@@ -663,18 +604,12 @@ class PolymarketClient:
         side: str,
         size: Decimal,
     ) -> Dict[str, Any]:
-        """
-        检查流动性是否足够
-        
-        Returns:
-            {"sufficient": bool, "available_size": Decimal, "depth": Dict}
-        """
+        """检查流动性是否足够"""
         orderbook = await self.get_orderbook(market_id, side)
         
         if not orderbook:
             return {"sufficient": False, "available_size": Decimal("0"), "depth": {}}
         
-        # 计算可用流动性 (asks side)
         asks = orderbook.get("asks", [])
         available = Decimal("0")
         depth = {"levels": len(asks)}
@@ -690,7 +625,7 @@ class PolymarketClient:
         }
     
     # ═══════════════════════════════════════════════════════════════
-    # CLOB API - 交易执行 (需认证)
+    # CLOB API - 交易执行 (通过 py-clob-client 签名)
     # ═══════════════════════════════════════════════════════════════
     
     @with_retry(max_retries=2, base_delay=0.5)
@@ -700,20 +635,17 @@ class PolymarketClient:
         side: str,
         size: Decimal,
         price: Decimal,
-        order_type: str = "GTC",  # GTC, GTD, FOK, IOC
+        order_type: str = "GTC",
     ) -> OrderResult:
         """
-        下单 (Limit Order)
+        下单 (通过 py-clob-client 处理 EIP-712 订单签名)
         
         Args:
             market_id: 市场ID
             side: 方向 ("YES" 或 "NO")
             size: 数量 (shares)
             price: 价格 (0-1)
-            order_type: 订单类型
-        
-        Returns:
-            订单结果
+            order_type: 订单类型 (GTC, GTD, FOK)
         """
         if self.dry_run:
             logger.info(
@@ -728,14 +660,16 @@ class PolymarketClient:
                 status="matched",
             )
         
-        # 检查认证
-        if not self._credentials:
+        if not self._clob_client or not self._credentials:
             return OrderResult(
                 success=False,
-                error="未认证: 缺少 L2 API credentials"
+                error="未认证: 缺少 L2 API credentials 或 ClobClient 未初始化"
             )
         
         try:
+            from py_clob_client.clob_types import OrderArgs, OrderType as ClobOrderType
+            from py_clob_client.order_builder.constants import BUY, SELL
+
             # 获取 token ID
             token_ids = await self.get_token_ids(market_id)
             token_id = token_ids.get(side.lower())
@@ -746,44 +680,55 @@ class PolymarketClient:
                     error=f"无法获取 {side} token ID"
                 )
             
-            # 构建订单
-            order_data = {
-                "token_id": token_id,
-                "side": "BUY",  # 总是 BUY shares
-                "size": str(size),
-                "price": str(price),
-                "expiration": int(time.time()) + 86400,  # 24h
-                "type": order_type,
-            }
+            # 构建订单参数 — BUY 用于开仓买入，SELL 由 close_position 使用
+            order_args = OrderArgs(
+                price=float(price),
+                size=float(size),
+                side=BUY,
+                token_id=token_id,
+            )
             
-            # 签名请求
-            body = json.dumps(order_data)
-            headers = self._sign_request("POST", "/order", body)
-            
-            async with self._session.post(
-                f"{PolymarketAPI.CLOB_API}/order",
-                json=order_data,
-                headers=headers
-            ) as response:
-                if response.status in [200, 201]:
-                    data = await response.json()
-                    return OrderResult(
-                        success=True,
-                        order_id=data.get("orderID") or data.get("id"),
-                        filled_size=Decimal(str(data.get("sizeMatched", size))),
-                        filled_price=Decimal(str(data.get("avgPrice", price))),
-                        avg_price=Decimal(str(data.get("avgPrice", price))),
-                        status=data.get("status", "matched"),
-                    )
+            # 映射订单类型
+            clob_order_type = ClobOrderType.GTC
+            if order_type == "FOK":
+                clob_order_type = ClobOrderType.FOK
+            elif order_type == "GTD":
+                clob_order_type = ClobOrderType.GTD
+
+            logger.info(
+                f"下单 | 市场: {market_id} | 方向: {side} | "
+                f"数量: {size} | 价格: {price} | 类型: {order_type}"
+            )
+
+            # 在线程中执行 (py-clob-client 使用同步 requests)
+            resp = await asyncio.to_thread(
+                self._clob_client.create_and_post_order,
+                order_args,
+                clob_order_type,
+            )
+
+            if resp:
+                order_id = resp.get("orderID") or resp.get("id", "")
+                status = resp.get("status", "live")
+                size_matched = resp.get("sizeMatched", "0")
                 
-                error_text = await response.text()
+                logger.info(f"✓ 下单成功 | 订单ID: {order_id} | 状态: {status}")
+                
                 return OrderResult(
-                    success=False,
-                    error=f"HTTP {response.status}: {error_text}"
+                    success=True,
+                    order_id=order_id,
+                    filled_size=Decimal(str(size_matched)) if size_matched else Decimal("0"),
+                    filled_price=price,
+                    avg_price=price,
+                    status=status,
                 )
+            else:
+                return OrderResult(success=False, error="py-clob-client 返回空响应")
                 
         except Exception as e:
             logger.error(f"下单异常: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
             return OrderResult(success=False, error=str(e))
     
     async def place_market_order(
@@ -794,38 +739,29 @@ class PolymarketClient:
         max_slippage: Decimal = Decimal("0.02"),
     ) -> OrderResult:
         """
-        市价单 (FOK/IOC)
+        市价单 (FOK)
         
         快速跟单推荐使用此方法
-        
-        Args:
-            market_id: 市场ID
-            side: 方向
-            size: 数量
-            max_slippage: 最大滑点
         """
-        # 获取当前价格
         price_data = await self.get_market_price(market_id)
         if not price_data:
             return OrderResult(success=False, error="无法获取市场价格")
         
-        # 根据方向和滑点计算价格
         if side.upper() == "YES":
             price = price_data["yes_ask"] if "yes_ask" in price_data else price_data["yes"]
-            price = price * (1 + max_slippage)  # 买入稍高
+            price = price * (1 + max_slippage)
         else:
             price = price_data["no_ask"] if "no_ask" in price_data else price_data["no"]
             price = price * (1 + max_slippage)
         
-        price = min(Decimal("1"), price)  # 不能超过 1
+        price = min(Decimal("1"), price)
         
-        # 使用 IOC (Immediate or Cancel) 订单
         return await self.place_order(
             market_id=market_id,
             side=side,
             size=size,
             price=price,
-            order_type="IOC",
+            order_type="FOK",
         )
     
     async def close_position(
@@ -835,70 +771,120 @@ class PolymarketClient:
         size: Decimal,
     ) -> OrderResult:
         """
-        平仓
+        平仓 — 卖出持有的 shares
         
         Args:
             market_id: 市场ID
             side: 你持有的方向 ("YES" 或 "NO")
             size: 平仓数量
-        
-        Returns:
-            订单结果
         """
-        # 平仓 = 卖出持有的 shares = 买入相反方向的 shares
-        opposite_side = "NO" if side.upper() == "YES" else "YES"
-        
-        # 获取当前价格
-        price_data = await self.get_market_price(market_id)
-        if not price_data:
-            return OrderResult(success=False, error="无法获取市场价格")
-        
-        # 平仓价格
-        if side.upper() == "YES":
-            # 持有 YES, 卖出 = 买 NO
-            price = price_data["no_ask"] if "no_ask" in price_data else price_data["no"]
-        else:
-            # 持有 NO, 卖出 = 买 YES
-            price = price_data["yes_ask"] if "yes_ask" in price_data else price_data["yes"]
-        
-        logger.info(
-            f"平仓 | 市场: {market_id} | "
-            f"持仓: {side} | 平仓价格: {price}"
-        )
-        
-        return await self.place_order(
-            market_id=market_id,
-            side=opposite_side,
-            size=size,
-            price=price,
-            order_type="IOC",
-        )
+        if self.dry_run:
+            logger.info(f"[模拟] 平仓 | 市场: {market_id} | 持仓: {side} | 数量: {size}")
+            return OrderResult(
+                success=True,
+                order_id=f"dry_run_close_{int(time.time())}",
+                filled_size=size,
+                status="matched",
+            )
+
+        if not self._clob_client or not self._credentials:
+            return OrderResult(
+                success=False,
+                error="未认证: 缺少 L2 API credentials"
+            )
+
+        try:
+            from py_clob_client.clob_types import OrderArgs, OrderType as ClobOrderType
+            from py_clob_client.order_builder.constants import SELL
+
+            # 获取持有方向的 token ID
+            token_ids = await self.get_token_ids(market_id)
+            token_id = token_ids.get(side.lower())
+            
+            if not token_id:
+                return OrderResult(success=False, error=f"无法获取 {side} token ID")
+
+            # 获取当前价格作为卖出参考
+            price_data = await self.get_market_price(market_id)
+            if not price_data:
+                return OrderResult(success=False, error="无法获取市场价格")
+
+            # 使用 bid 价格（买方最高出价），更接近实际成交价
+            side_lower = side.lower()
+            bid_key = f"{side_lower}_bid"
+            current_price = price_data.get(bid_key, price_data.get(side_lower, Decimal("0.5")))
+            sell_price = float(current_price * Decimal("0.98"))  # 允许 2% 滑点
+            sell_price = max(0.01, min(0.99, sell_price))  # 限制在合理范围
+
+            order_args = OrderArgs(
+                price=sell_price,
+                size=float(size),
+                side=SELL,
+                token_id=token_id,
+            )
+
+            logger.info(
+                f"平仓 | 市场: {market_id} | 持仓: {side} | "
+                f"数量: {size} | 卖出价格: {sell_price:.4f}"
+            )
+
+            resp = await asyncio.to_thread(
+                self._clob_client.create_and_post_order,
+                order_args,
+                ClobOrderType.FOK,
+            )
+
+            if resp:
+                order_id = resp.get("orderID") or resp.get("id", "")
+                status = resp.get("status", "live")
+                logger.info(f"✓ 平仓成功 | 订单ID: {order_id} | 状态: {status}")
+                return OrderResult(
+                    success=True,
+                    order_id=order_id,
+                    filled_size=Decimal(str(resp.get("sizeMatched", size))),
+                    filled_price=Decimal(str(sell_price)),
+                    status=status,
+                )
+            else:
+                return OrderResult(success=False, error="平仓响应为空")
+
+        except Exception as e:
+            logger.error(f"平仓异常: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return OrderResult(success=False, error=str(e))
     
     async def cancel_order(self, order_id: str) -> bool:
         """取消订单"""
         if self.dry_run:
             return True
-        
-        headers = self._sign_request("DELETE", f"/order/{order_id}")
-        
-        async with self._session.delete(
-            f"{PolymarketAPI.CLOB_API}/order/{order_id}",
-            headers=headers
-        ) as response:
-            return response.status == 200
+
+        if not self._clob_client:
+            logger.error("ClobClient 未初始化，无法取消订单")
+            return False
+
+        try:
+            resp = await asyncio.to_thread(self._clob_client.cancel, order_id)
+            return bool(resp)
+        except Exception as e:
+            logger.error(f"取消订单异常: {e}")
+            return False
     
     async def cancel_all_orders(self) -> bool:
         """取消所有订单"""
         if self.dry_run:
             return True
-        
-        headers = self._sign_request("DELETE", "/orders")
-        
-        async with self._session.delete(
-            f"{PolymarketAPI.CLOB_API}/orders",
-            headers=headers
-        ) as response:
-            return response.status == 200
+
+        if not self._clob_client:
+            logger.error("ClobClient 未初始化，无法取消订单")
+            return False
+
+        try:
+            resp = await asyncio.to_thread(self._clob_client.cancel_all)
+            return bool(resp)
+        except Exception as e:
+            logger.error(f"取消所有订单异常: {e}")
+            return False
     
     # ═══════════════════════════════════════════════════════════════
     # 工具方法
@@ -932,52 +918,96 @@ class PolymarketClient:
     
     async def get_account_balance(self) -> Optional[Decimal]:
         """
-        获取账户余额
+        获取账户 USDC 余额
 
-        注意:
-        - Gnosis Safe 模式下，余额存放在 Proxy 地址（funder_address）
-        - EOA 模式下，余额存放在钱包地址（wallet_address）
-        - 如果未连接或认证失败，返回 None
+        通过链上查询 Proxy 地址 (funder) 的 USDC 余额。
+        Polymarket 使用 Polygon 上的 USDC (PoS)。
+        注意: 需要先在 polymarket.com 存入资金，直接转 USDC 到 funder 地址不一定可用。
         """
         if self.dry_run:
             return Decimal("1000")
 
-        # 检查连接状态
         if not self._is_connected or not self._session:
             logger.warning("未连接到 Polymarket API，无法获取余额")
             return None
 
-        # 通过 CLOB API 获取余额
-        # 如果是 Gnosis Safe 模式，使用 funder 作为查询参数
         address_to_query = self.funder_address if self.signature_type == SignatureType.POLY_GNOSIS_SAFE else self.wallet_address
 
         logger.debug(f"查询余额地址: {address_to_query[:10]}...")
 
-        headers = self._sign_request("GET", "/balance")
+        # 方法1: 通过 py-clob-client 查询 CTF Exchange 余额
+        if self._clob_client:
+            try:
+                from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+                params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+                balance_info = await asyncio.to_thread(
+                    self._clob_client.get_balance_allowance, params
+                )
+                if balance_info:
+                    # py-clob-client 返回的 balance 已是字符串格式的原始值 (6 decimals)
+                    raw = balance_info.get("balance", "0") if isinstance(balance_info, dict) else getattr(balance_info, "balance", "0")
+                    raw_val = int(str(raw))
+                    balance = Decimal(raw_val) / Decimal("1000000")
+                    logger.info(f"账户余额: ${balance:.2f} (地址: {address_to_query[:10]}...)")
+                    return balance
+            except ImportError:
+                logger.debug("py-clob-client 无 BalanceAllowanceParams，尝试备用方式")
+            except Exception as e:
+                logger.debug(f"通过 py-clob-client 查余额失败: {e}, 尝试备用方式")
 
-        # 构建查询参数
-        params = {}
-        if address_to_query != self.wallet_address:
-            params["funder"] = address_to_query
-
+        # 方法2: 直接调 CLOB API /balance-allowance 端点
         try:
-            async with self._session.get(
-                f"{PolymarketAPI.CLOB_API}/balance",
+            headers = self._get_l2_headers()
+            params = {
+                "asset_type": "COLLATERAL",
+                "signature_type": str(self.signature_type.value),
+            }
+            session = self._check_session()
+            async with session.get(
+                f"{PolymarketAPI.CLOB_API}/balance-allowance",
                 headers=headers,
-                params=params
+                params=params,
+                timeout=aiohttp.ClientTimeout(total=10)
             ) as response:
                 if response.status == 200:
                     data = await response.json()
-                    balance = Decimal(str(data.get("balance", 0)))
+                    raw = data.get("balance", "0")
+                    raw_val = int(str(raw))
+                    balance = Decimal(raw_val) / Decimal("1000000")
                     logger.info(f"账户余额: ${balance:.2f} (地址: {address_to_query[:10]}...)")
                     return balance
                 else:
                     error_text = await response.text()
-                    logger.error(f"获取余额失败: {response.status} - {error_text}")
-                    return None
+                    logger.warning(f"CLOB 余额查询失败: {response.status} - {error_text[:200]}")
+        except Exception as e:
+            logger.debug(f"CLOB 余额查询异常: {e}")
+
+        # 方法3: 链上查 Proxy 地址的 USDC 裸余额 (兜底)
+        try:
+            usdc_address = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+            data = f"0x70a08231000000000000000000000000{address_to_query[2:].lower()}"
+            async with session.post(
+                "https://polygon-rpc.com",
+                json={
+                    "jsonrpc": "2.0",
+                    "method": "eth_call",
+                    "params": [{"to": usdc_address, "data": data}, "latest"],
+                    "id": 1,
+                },
+                timeout=aiohttp.ClientTimeout(total=10)
+            ) as response:
+                if response.status == 200:
+                    result = await response.json()
+                    hex_balance = result.get("result", "0x0")
+                    raw_balance = int(hex_balance, 16)
+                    balance = Decimal(raw_balance) / Decimal("1000000")
+                    logger.info(f"账户余额 (链上USDC): ${balance:.2f} (地址: {address_to_query[:10]}...)")
+                    return balance
         except Exception as e:
             logger.error(f"获取余额异常: {e}")
-            return None
+
+        logger.error("所有余额查询方式均失败")
+        return None
     
     def _generate_mock_markets(self, count: int) -> List[Dict[str, Any]]:
         """生成模拟市场数据"""
